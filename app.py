@@ -6,11 +6,13 @@ import plotly.express as px
 import plotly.graph_objects as go
 from contextlib import contextmanager
 import calendar
+import time 
 
 # ---------- DATABASE UTILITIES ----------
 @contextmanager
 def get_db_connection():
     """Context manager for database connections"""
+    # check_same_thread=False is needed for Streamlit's multiprocessing model
     conn = sqlite3.connect("expenses.db", check_same_thread=False)
     conn.row_factory = sqlite3.Row
     try:
@@ -63,10 +65,12 @@ def get_expense_summary():
         return None
     
     today = datetime.now()
+    # Use to_period() for reliable month filtering
+    monthly_expenses = df[df['date'].dt.to_period('M') == today.to_period('M')]['amount'].sum()
+    
+    # Calculate expenses for the last 30 and 7 days based on current date
     last_30_days = today - timedelta(days=30)
     last_7_days = today - timedelta(days=7)
-    
-    monthly_expenses = df[df['date'].dt.to_period('M') == today.strftime('%Y-%m')]['amount'].sum()
     last_30_days_expenses = df[df['date'] >= last_30_days]['amount'].sum()
     last_7_days_expenses = df[df['date'] >= last_7_days]['amount'].sum()
     
@@ -97,9 +101,10 @@ def create_monthly_trend_chart(df):
     fig = px.line(monthly, x='date', y='amount', 
                   title='Monthly Expense Trends',
                   labels={'amount': 'Amount (₹)', 'date': 'Month'},
-                  line_shape='spline')
+                  line_shape='spline',
+                  custom_data=[monthly['amount_formatted'], monthly['id']])
     fig.update_traces(line=dict(width=4, color='#3b82f6'),
-                      hovertemplate='<b>%{x}</b><br>Amount: %{customdata}<br>Transactions: %{y}<extra></extra>')
+                      hovertemplate='<b>%{x}</b><br>Amount: %{customdata[0]}<br>Transactions: %{customdata[1]}<extra></extra>')
     fig.update_layout(hoverlabel=dict(bgcolor="white", font_size=12))
     return fig
 
@@ -111,7 +116,9 @@ def create_category_pie_chart(df):
     
     fig = px.pie(category_totals, values='amount', names='category',
                  title='Expense Distribution by Category',
-                 hole=0.4)
+                 hole=0.4,
+                 custom_data=[category_totals['amount_formatted']])
+    fig.update_traces(hovertemplate='<b>%{label}</b><br>Amount: %{customdata[0]}<br>Percentage: %{percent}<extra></extra>')
     return fig
 
 def create_daily_expense_chart(df):
@@ -127,8 +134,10 @@ def create_daily_expense_chart(df):
     
     fig = px.bar(daily, x='date', y='amount',
                  title='Daily Expenses (Last 30 Days)',
-                 labels={'amount': 'Amount (₹)', 'date': 'Date'})
-    fig.update_traces(marker_color='#10b981')
+                 labels={'amount': 'Amount (₹)', 'date': 'Date'},
+                 custom_data=[daily['amount_formatted']])
+    fig.update_traces(marker_color='#10b981',
+                      hovertemplate='<b>%{x}</b><br>Amount: %{customdata[0]}<extra></extra>')
     return fig
 
 def create_category_bar_chart(df):
@@ -140,8 +149,10 @@ def create_category_bar_chart(df):
     fig = px.bar(category_totals, y='category', x='amount',
                  title='Expenses by Category',
                  labels={'amount': 'Amount (₹)', 'category': 'Category'},
-                 orientation='h')
-    fig.update_traces(marker_color='#8b5cf6')
+                 orientation='h',
+                 custom_data=[category_totals['amount_formatted']])
+    fig.update_traces(marker_color='#8b5cf6',
+                      hovertemplate='<b>%{y}</b><br>Amount: %{customdata[0]}<extra></extra>')
     return fig
 
 def create_expense_calendar_heatmap(df):
@@ -154,7 +165,8 @@ def create_expense_calendar_heatmap(df):
     fig = px.density_heatmap(daily_expenses, x='day_name', y='month', z='amount',
                              title='Expense Calendar Heatmap',
                              category_orders={'day_name': ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'],
-                                             'month': list(calendar.month_name[1:])})
+                                             'month': list(calendar.month_name[1:])},
+                             color_continuous_scale="Blues")
     return fig
 
 def create_spending_timeline(df):
@@ -170,19 +182,20 @@ def create_spending_timeline(df):
     fig.add_trace(go.Scatter(x=df_sorted['date'], y=df_sorted['cumulative_amount'],
                              mode='lines', name='Cumulative Spending',
                              line=dict(color='#3b82f6', width=3),
-                             customdata=df_sorted['cumulative_formatted'],
+                             customdata=df_sorted['cumulative_formatted'], # Use formatted data for hover
                              hovertemplate='<b>%{x}</b><br>Cumulative: %{customdata}<extra></extra>'))
     
     # Add individual expense points
     fig.add_trace(go.Scatter(x=df_sorted['date'], y=df_sorted['amount'],
                              mode='markers', name='Individual Expenses',
                              marker=dict(color='#ef4444', size=6),
-                             customdata=df_sorted['amount_formatted'],
+                             customdata=df_sorted['amount_formatted'], # Use formatted data for hover
                              hovertemplate='<b>%{x}</b><br>Amount: %{customdata}<extra></extra>'))
     
     fig.update_layout(title='Cumulative Spending Timeline',
                       xaxis_title='Date',
-                      yaxis_title='Amount (₹)')
+                      yaxis_title='Amount (₹)',
+                      hovermode='x unified')
     return fig
 
 # ---------- PAGE CONFIG ----------
@@ -203,10 +216,9 @@ st.markdown("""
         /* --- CSS FOR THE APP TITLE --- */
         .app-title {
             text-align: center;
-            font-size: 4em; /* Adjust size as needed */
+            font-size: 4em; 
             font-weight: 900;
-            color: transparent; /* Make text transparent */
-            /* Use a gradient effect for the text */
+            color: transparent; 
             background: linear-gradient(90deg, #4f46e5, #3b82f6, #1e40af); 
             -webkit-background-clip: text;
             background-clip: text;
@@ -224,7 +236,6 @@ st.markdown("""
             justify-content: center;
             align-items: center;
             gap: 20px;
-            /* margin-bottom is handled by the title section now */
             border: 1px solid #333;
         }
         .stButton button {
@@ -242,15 +253,20 @@ st.markdown("""
             transform: translateY(-2px);
             box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
         }
-        metric-card {
+        .metric-card {
             background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
             padding: 20px;
             border-radius: 12px;
             border: 1px solid #475569;
             text-align: center;
-            **min-height: 140px;** display: flex;
+            /* FIX: ADDED FOR UNIFORM HEIGHT and ALIGNMENT */
+            min-height: 140px; 
+            display: flex; 
             flex-direction: column;
             justify-content: center;
+        }
+        .metric-card h3 {
+            margin-bottom: 5px; /* Adjust spacing inside card */
         }
         .success-message {
             padding: 12px;
@@ -277,7 +293,7 @@ if "page" not in st.session_state:
     st.session_state.page = "Dashboard"
 
 # ---------- NAVIGATION ----------
-# ADD THE APP TITLE HERE
+# ADDED TITLE
 st.markdown("<h1 class='app-title'>SmartSpend</h1>", unsafe_allow_html=True) 
 
 # Start the navigation container
@@ -301,14 +317,16 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------- PAGE LOGIC ----------
 if st.session_state.page == "Dashboard":
-    st.header("📊 Expense Dashboard")
+    # FONT SIZE REDUCTION: Changed st.header to st.subheader
+    st.subheader("📊 Expense Dashboard") 
     
     df = get_all_expenses()
     summary = get_expense_summary()
     
     if summary and not df.empty:
-        # Key Metrics
         st.subheader("📈 Key Metrics")
+        
+        # Row 1 of Metrics
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
@@ -343,7 +361,7 @@ if st.session_state.page == "Dashboard":
                 </div>
             """, unsafe_allow_html=True)
 
-        # Additional Metrics
+        # Row 2 of Metrics
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
@@ -381,7 +399,7 @@ if st.session_state.page == "Dashboard":
         # Charts Section
         st.subheader("📊 Visual Analytics")
         
-        # Row 1: Main Charts
+        # Row 1: Monthly Trend and Category Pie
         col1, col2 = st.columns(2)
         
         with col1:
@@ -396,8 +414,9 @@ if st.session_state.page == "Dashboard":
             st.plotly_chart(category_pie, use_container_width=True)
             st.markdown("</div>", unsafe_allow_html=True)
         
-        # Row 2: Additional Charts
-        col1, col2 = st.columns(2)
+        # Row 2: Category Bar and Daily Expense Chart (Top charts in your last image)
+        # Reusing st.columns(2) here puts them directly below Row 1.
+        col1, col2 = st.columns(2) 
         
         with col1:
             st.markdown("<div class='chart-container'>", unsafe_allow_html=True)
@@ -414,7 +433,8 @@ if st.session_state.page == "Dashboard":
                 st.info("No expenses in the last 30 days")
             st.markdown("</div>", unsafe_allow_html=True)
         
-        # Row 3: Advanced Charts
+        # Row 3: Advanced Charts (Bottom charts in your last image)
+        # Reusing st.columns(2) here puts them directly below Row 2.
         col1, col2 = st.columns(2)
         
         with col1:
@@ -460,7 +480,7 @@ elif st.session_state.page == "Add Expense":
             else:
                 try:
                     add_expense(category, amount, expense_date, description)
-                    st.markdown("<div class='success-message'>✅ Expense added successfully!</div>", unsafe_allow_html=True)
+                    st.markdown("<div class='success-message'>✅ **Expense added successfully!**</div>", unsafe_allow_html=True)
                     st.balloons()
                 except Exception as e:
                     st.error(f"Error adding expense: {str(e)}")
@@ -565,8 +585,6 @@ elif st.session_state.page == "Delete Expense":
                     success = delete_expense(expense_to_delete)
                     if success:
                         st.markdown("<div class='success-message'>✅ **Expense deleted successfully!**</div>", unsafe_allow_html=True)
-                        # Use a small sleep before rerun for success message to display briefly
-                        import time
                         time.sleep(1.5)
                         st.rerun()
                     else:

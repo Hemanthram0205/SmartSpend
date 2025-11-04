@@ -21,13 +21,13 @@ It allows users to add, view, analyze, and delete expenses — with interactive 
 
 ## 🧩 Tech Stack
 
- Component  Technology Used 
------------------------------
- - **Frontend/UI** - Streamlit 
- - **Backend** - Python 
- - **Database** - SQLite 
- - **Visualization** - Plotly 
- - **Machine Learning** - Scikit-learn 
+| Component | Technology Used |
+|------------|-----------------|
+| **Frontend/UI** | Streamlit |
+| **Backend** | Python |
+| **Database** | SQLite |
+| **Visualization** | Plotly |
+| **Machine Learning (optional)** | Scikit-learn | 
 
 
 

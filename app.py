@@ -322,6 +322,7 @@ st.markdown("""
             align-items: center;
             gap: 20px;
             border: 1px solid #333;
+            margin-bottom: 30px;
         }
         .stButton button {
             background: linear-gradient(135deg, #3b82f6 0%, #1e40af 100%);
@@ -337,6 +338,22 @@ st.markdown("""
         .stButton button:hover {
             transform: translateY(-2px);
             box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+        }
+        .logout-button button {
+            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%) !important;
+        }
+        .logout-button button:hover {
+            background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%) !important;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(239, 68, 68, 0.4) !important;
+        }
+        .user-welcome {
+            text-align: center;
+            background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+            padding: 15px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            border: 1px solid #475569;
         }
         .metric-card {
             background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
@@ -477,31 +494,16 @@ def show_register_form():
 # ---------- MAIN APP ----------
 def show_main_app():
     """Show the main application after authentication"""
-    # User info in sidebar
-    with st.sidebar:
-        st.success(f"👋 Welcome, **{st.session_state.username}**!")
-        if st.button("🚪 Logout"):
-            st.session_state.user_id = None
-            st.session_state.username = None
-            st.session_state.show_login = True
-            st.rerun()
-        
-        st.markdown("---")
-        st.markdown("### 💡 Quick Stats")
-        df = get_current_user_expenses(st.session_state.user_id)
-        if not df.empty and 'amount' in df.columns:
-            total = df['amount'].sum()
-            count = len(df)
-            st.metric("Total Expenses", format_currency(total))
-            st.metric("Transaction Count", count)
-        else:
-            st.info("No expenses yet")
+    # User welcome message at top
+    st.markdown(f"""
+        <div class="user-welcome">
+            <h3>👋 Welcome back, <strong>{st.session_state.username}</strong>!</h3>
+        </div>
+    """, unsafe_allow_html=True)
     
-    # Navigation
-    st.markdown("<h1 class='app-title'>SmartSpend</h1>", unsafe_allow_html=True)
-    
+    # Navigation with logout button
     st.markdown("<div class='nav-container'>", unsafe_allow_html=True)
-    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+    col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
 
     with col1:
         if st.button("📊 Dashboard", use_container_width=True):
@@ -515,6 +517,13 @@ def show_main_app():
     with col4:
         if st.button("❌ Delete Expense", use_container_width=True):
             st.session_state.page = "Delete Expense"
+    with col5:
+        # Logout button with custom styling
+        if st.button("🚪 Logout", use_container_width=True, key="logout_main"):
+            st.session_state.user_id = None
+            st.session_state.username = None
+            st.session_state.show_login = True
+            st.rerun()
 
     st.markdown("</div>", unsafe_allow_html=True)
 

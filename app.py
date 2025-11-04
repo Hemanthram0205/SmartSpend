@@ -64,13 +64,15 @@ def get_expense_summary():
     if df.empty:
         return None
     
-    today = datetime.now()
-    # Use to_period() for reliable month filtering
-    monthly_expenses = df[df['date'].dt.to_period('M') == today.to_period('M')]['amount'].sum()
+    # FIX: Explicitly ensure 'date' is datetime type, preventing AttributeError
+    df['date'] = pd.to_datetime(df['date'])
     
-    # Calculate expenses for the last 30 and 7 days based on current date
+    today = datetime.now()
     last_30_days = today - timedelta(days=30)
     last_7_days = today - timedelta(days=7)
+    
+    # Use to_period() for reliable month filtering
+    monthly_expenses = df[df['date'].dt.to_period('M') == today.to_period('M')]['amount'].sum()
     last_30_days_expenses = df[df['date'] >= last_30_days]['amount'].sum()
     last_7_days_expenses = df[df['date'] >= last_7_days]['amount'].sum()
     
@@ -317,7 +319,7 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------- PAGE LOGIC ----------
 if st.session_state.page == "Dashboard":
-    # FONT SIZE REDUCTION: Changed st.header to st.subheader
+    # FONT SIZE REDUCTION: Using st.subheader
     st.subheader("📊 Expense Dashboard") 
     
     df = get_all_expenses()
@@ -414,8 +416,7 @@ if st.session_state.page == "Dashboard":
             st.plotly_chart(category_pie, use_container_width=True)
             st.markdown("</div>", unsafe_allow_html=True)
         
-        # Row 2: Category Bar and Daily Expense Chart (Top charts in your last image)
-        # Reusing st.columns(2) here puts them directly below Row 1.
+        # Row 2: Category Bar and Daily Expense Chart 
         col1, col2 = st.columns(2) 
         
         with col1:
@@ -433,8 +434,7 @@ if st.session_state.page == "Dashboard":
                 st.info("No expenses in the last 30 days")
             st.markdown("</div>", unsafe_allow_html=True)
         
-        # Row 3: Advanced Charts (Bottom charts in your last image)
-        # Reusing st.columns(2) here puts them directly below Row 2.
+        # Row 3: Advanced Charts 
         col1, col2 = st.columns(2)
         
         with col1:

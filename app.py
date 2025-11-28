@@ -1,1797 +1,1202 @@
-"""
-SmartSpend - Professional Expense Tracker Application
-A secure, multi-user expense tracking system with comprehensive analytics.
-
-Author: Hemanth Ram. S
-Version: 2.0.0
-License: MIT
-"""
-
-import streamlit as st
-import sqlite3
-import pandas as pd
-from datetime import datetime, date, timedelta
-from contextlib import contextmanager
-from typing import Optional, Tuple, Dict, Any, List
-from dataclasses import dataclass
-from enum import Enum
-import calendar
-import hashlib
-import secrets
-import logging
-from pathlib import Path
-
-# Third-party imports for visualization
-import plotly.express as px
-import plotly.graph_objects as go
-
-# ============================================================================
-# CONFIGURATION & CONSTANTS
-# ============================================================================
-
-class Config:
-    """Application configuration constants."""
-    APP_NAME = "SmartSpend"
-    APP_VERSION = "2.0.0"
-    DATABASE_NAME = "expenses.db"
-    PASSWORD_MIN_LENGTH = 8
-    PASSWORD_SALT_LENGTH = 32
-    SESSION_TIMEOUT_MINUTES = 30
-    CURRENCY_SYMBOL = "₹"
-    DATE_FORMAT = "%d-%m-%Y"
-    DATETIME_FORMAT = "%d-%m-%Y %H:%M:%S"
-    
-class ExpenseCategory(Enum):
-    """Predefined expense categories."""
-    FOOD = "Food"
-    TRANSPORT = "Transport"
-    SHOPPING = "Shopping"
-    BILLS = "Bills"
-    ENTERTAINMENT = "Entertainment"
-    HEALTHCARE = "Healthcare"
-    EDUCATION = "Education"
-    INVESTMENT = "Investment"
-    OTHER = "Other"
-    
-    @classmethod
-    def get_list(cls) -> List[str]:
-        """Return list of category values."""
-        return [cat.value for cat in cls]
-
-class ThemeColors:
-    """UI theme color constants."""
-    PRIMARY = "#3b82f6"
-    PRIMARY_DARK = "#1e40af"
-    SUCCESS = "#10b981"
-    DANGER = "#ef4444"
-    WARNING = "#f59e0b"
-    INFO = "#6366f1"
-    BACKGROUND_DARK = "#0f1115"
-    CARD_BACKGROUND = "#1e293b"
-    CARD_BORDER = "#475569"
-
-# ============================================================================
-# LOGGING CONFIGURATION
-# ============================================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('smartspend.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# ============================================================================
-# DATA MODELS
-# ============================================================================
-
-@dataclass
-class User:
-    """User model."""
-    id: int
-    username: str
-    email: Optional[str] = None
-    created_at: Optional[datetime] = None
-
-@dataclass
-class Expense:
-    """Expense model."""
-    id: int
-    category: str
-    amount: float
-    date: datetime
-    description: str
-    user_id: int
-    created_at: Optional[datetime] = None
-
-@dataclass
-class ExpenseSummary:
-    """Expense summary statistics model."""
-    total_expenses: float
-    average_expense: float
-    expense_count: int
-    top_category: str
-    largest_expense: float
-    monthly_expenses: float
-    last_30_days: float
-    last_7_days: float
-    daily_average: float
-
-# ============================================================================
-# DATABASE UTILITIES
-# ============================================================================
-
-class DatabaseManager:
-    """Centralized database management class."""
-    
-    def __init__(self, db_name: str = Config.DATABASE_NAME):
-        """Initialize database manager."""
-        self.db_name = db_name
-        self.db_path = Path(db_name)
-        
-    @contextmanager
-    def get_connection(self):
-        """
-        Context manager for database connections.
-        
-        Yields:
-            sqlite3.Connection: Database connection object
-        """
-        conn = None
-        try:
-            conn = sqlite3.connect(
-                self.db_name,
-                check_same_thread=False,
-                timeout=10.0
-            )
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA foreign_keys = ON")
-            yield conn
-        except sqlite3.Error as e:
-            logger.error(f"Database connection error: {e}")
-            raise
-        finally:
-            if conn:
-                conn.close()
-    
-    def initialize_schema(self) -> None:
-        """Initialize database schema with proper tables and indices."""
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # Users table
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS users (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        username TEXT UNIQUE NOT NULL,
-                        password_hash TEXT NOT NULL,
-                        password_salt TEXT NOT NULL,
-                        email TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        last_login TIMESTAMP,
-                        is_active BOOLEAN DEFAULT 1,
-                        CONSTRAINT username_length CHECK (LENGTH(username) >= 3)
-                    )
-                ''')
-                
-                # Expenses table
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS expenses (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        category TEXT NOT NULL,
-                        amount REAL NOT NULL CHECK(amount > 0),
-                        date TEXT NOT NULL,
-                        description TEXT DEFAULT '',
-                        user_id INTEGER NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-                    )
-                ''')
-                
-                # Create indices for performance
-                cursor.execute('''
-                    CREATE INDEX IF NOT EXISTS idx_expenses_user_date 
-                    ON expenses(user_id, date DESC)
-                ''')
-                
-                cursor.execute('''
-                    CREATE INDEX IF NOT EXISTS idx_expenses_category 
-                    ON expenses(category)
-                ''')
-                
-                cursor.execute('''
-                    CREATE INDEX IF NOT EXISTS idx_users_username 
-                    ON users(username)
-                ''')
-                
-                # Trigger for updated_at timestamp
-                cursor.execute('''
-                    CREATE TRIGGER IF NOT EXISTS update_expense_timestamp 
-                    AFTER UPDATE ON expenses
-                    BEGIN
-                        UPDATE expenses SET updated_at = CURRENT_TIMESTAMP
-                        WHERE id = NEW.id;
-                    END
-                ''')
-                
-                conn.commit()
-                logger.info("Database schema initialized successfully")
-                
-        except sqlite3.Error as e:
-            logger.error(f"Error initializing database schema: {e}")
-            raise
-    
-    def backup_database(self, backup_path: Optional[str] = None) -> bool:
-        """
-        Create a backup of the database.
-        
-        Args:
-            backup_path: Path for backup file. If None, auto-generates timestamped name.
-            
-        Returns:
-            bool: True if backup successful, False otherwise
-        """
-        try:
-            if backup_path is None:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                backup_path = f"backup_{Config.DATABASE_NAME}_{timestamp}.db"
-            
-            with self.get_connection() as conn:
-                backup_conn = sqlite3.connect(backup_path)
-                conn.backup(backup_conn)
-                backup_conn.close()
-                
-            logger.info(f"Database backed up to {backup_path}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Database backup failed: {e}")
-            return False
-
-# ============================================================================
-# SECURITY & AUTHENTICATION
-# ============================================================================
-
-class SecurityManager:
-    """Handle security-related operations."""
-    
-    @staticmethod
-    def generate_salt() -> str:
-        """Generate a random salt for password hashing."""
-        return secrets.token_hex(Config.PASSWORD_SALT_LENGTH)
-    
-    @staticmethod
-    def hash_password(password: str, salt: str) -> str:
-        """
-        Hash password with salt using SHA-256.
-        
-        Args:
-            password: Plain text password
-            salt: Random salt string
-            
-        Returns:
-            str: Hashed password
-        """
-        salted_password = f"{password}{salt}".encode()
-        return hashlib.sha256(salted_password).hexdigest()
-    
-    @staticmethod
-    def verify_password(password: str, password_hash: str, salt: str) -> bool:
-        """
-        Verify password against stored hash.
-        
-        Args:
-            password: Plain text password to verify
-            password_hash: Stored password hash
-            salt: Password salt
-            
-        Returns:
-            bool: True if password matches, False otherwise
-        """
-        return SecurityManager.hash_password(password, salt) == password_hash
-    
-    @staticmethod
-    def validate_password_strength(password: str) -> Tuple[bool, str]:
-        """
-        Validate password strength.
-        
-        Args:
-            password: Password to validate
-            
-        Returns:
-            Tuple of (is_valid, error_message)
-        """
-        if len(password) < Config.PASSWORD_MIN_LENGTH:
-            return False, f"Password must be at least {Config.PASSWORD_MIN_LENGTH} characters"
-        
-        if not any(c.isupper() for c in password):
-            return False, "Password must contain at least one uppercase letter"
-        
-        if not any(c.islower() for c in password):
-            return False, "Password must contain at least one lowercase letter"
-        
-        if not any(c.isdigit() for c in password):
-            return False, "Password must contain at least one number"
-        
-        return True, ""
-    
-    @staticmethod
-    def validate_username(username: str) -> Tuple[bool, str]:
-        """
-        Validate username format.
-        
-        Args:
-            username: Username to validate
-            
-        Returns:
-            Tuple of (is_valid, error_message)
-        """
-        if not username or len(username.strip()) < 3:
-            return False, "Username must be at least 3 characters"
-        
-        if not username.replace('_', '').replace('-', '').isalnum():
-            return False, "Username can only contain letters, numbers, underscore and hyphen"
-        
-        return True, ""
-
-# ============================================================================
-# USER MANAGEMENT
-# ============================================================================
-
-class UserManager:
-    """Manage user operations."""
-    
-    def __init__(self, db_manager: DatabaseManager):
-        """Initialize user manager with database manager."""
-        self.db = db_manager
-        self.security = SecurityManager()
-    
-    def create_user(
-        self,
-        username: str,
-        password: str,
-        email: Optional[str] = None
-    ) -> Tuple[bool, str]:
-        """
-        Create a new user account.
-        
-        Args:
-            username: Unique username
-            password: User password
-            email: Optional email address
-            
-        Returns:
-            Tuple of (success, message)
-        """
-        try:
-            # Validate inputs
-            username = username.strip()
-            
-            is_valid, error_msg = self.security.validate_username(username)
-            if not is_valid:
-                return False, error_msg
-            
-            is_valid, error_msg = self.security.validate_password_strength(password)
-            if not is_valid:
-                return False, error_msg
-            
-            # Hash password
-            salt = self.security.generate_salt()
-            password_hash = self.security.hash_password(password, salt)
-            
-            # Insert user
-            with self.db.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """INSERT INTO users (username, password_hash, password_salt, email)
-                       VALUES (?, ?, ?, ?)""",
-                    (username, password_hash, salt, email)
-                )
-                conn.commit()
-                
-            logger.info(f"User created successfully: {username}")
-            return True, "Account created successfully!"
-            
-        except sqlite3.IntegrityError:
-            logger.warning(f"Attempted to create duplicate username: {username}")
-            return False, "Username already exists"
-        except Exception as e:
-            logger.error(f"Error creating user: {e}")
-            return False, f"Error creating account: {str(e)}"
-    
-    def authenticate_user(
-        self,
-        username: str,
-        password: str
-    ) -> Optional[int]:
-        """
-        Authenticate user credentials.
-        
-        Args:
-            username: Username to authenticate
-            password: Password to verify
-            
-        Returns:
-            User ID if successful, None otherwise
-        """
-        try:
-            with self.db.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """SELECT id, password_hash, password_salt, is_active
-                       FROM users WHERE username = ?""",
-                    (username.strip(),)
-                )
-                user = cursor.fetchone()
-                
-                if not user:
-                    logger.warning(f"Login attempt for non-existent user: {username}")
-                    return None
-                
-                if not user['is_active']:
-                    logger.warning(f"Login attempt for inactive user: {username}")
-                    return None
-                
-                if self.security.verify_password(
-                    password,
-                    user['password_hash'],
-                    user['password_salt']
-                ):
-                    # Update last login
-                    cursor.execute(
-                        "UPDATE users SET last_login = ? WHERE id = ?",
-                        (datetime.now(), user['id'])
-                    )
-                    conn.commit()
-                    
-                    logger.info(f"Successful login: {username}")
-                    return user['id']
-                
-                logger.warning(f"Failed login attempt: {username}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Authentication error: {e}")
-            return None
-    
-    def get_user_info(self, user_id: int) -> Optional[User]:
-        """
-        Get user information by ID.
-        
-        Args:
-            user_id: User ID
-            
-        Returns:
-            User object if found, None otherwise
-        """
-        try:
-            with self.db.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT id, username, email, created_at FROM users WHERE id = ?",
-                    (user_id,)
-                )
-                row = cursor.fetchone()
-                
-                if row:
-                    return User(
-                        id=row['id'],
-                        username=row['username'],
-                        email=row['email'],
-                        created_at=row['created_at']
-                    )
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error fetching user info: {e}")
-            return None
-
-# ============================================================================
-# EXPENSE MANAGEMENT
-# ============================================================================
-
-class ExpenseManager:
-    """Manage expense operations."""
-    
-    def __init__(self, db_manager: DatabaseManager):
-        """Initialize expense manager with database manager."""
-        self.db = db_manager
-    
-    def add_expense(
-        self,
-        user_id: int,
-        category: str,
-        amount: float,
-        expense_date: date,
-        description: str = ""
-    ) -> Tuple[bool, str]:
-        """
-        Add a new expense.
-        
-        Args:
-            user_id: User ID who owns the expense
-            category: Expense category
-            amount: Expense amount
-            expense_date: Date of expense
-            description: Optional description
-            
-        Returns:
-            Tuple of (success, message)
-        """
-        try:
-            # Validate inputs
-            if amount <= 0:
-                return False, "Amount must be greater than zero"
-            
-            if category not in ExpenseCategory.get_list():
-                return False, "Invalid category"
-            
-            with self.db.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """INSERT INTO expenses (user_id, category, amount, date, description)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (user_id, category.strip(), amount, expense_date.isoformat(), description.strip())
-                )
-                conn.commit()
-                
-            logger.info(f"Expense added for user {user_id}: {category} - {amount}")
-            return True, "Expense added successfully!"
-            
-        except Exception as e:
-            logger.error(f"Error adding expense: {e}")
-            return False, f"Error adding expense: {str(e)}"
-    
-    def delete_expense(self, expense_id: int, user_id: int) -> Tuple[bool, str]:
-        """
-        Delete an expense (with ownership verification).
-        
-        Args:
-            expense_id: Expense ID to delete
-            user_id: User ID for ownership verification
-            
-        Returns:
-            Tuple of (success, message)
-        """
-        try:
-            with self.db.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "DELETE FROM expenses WHERE id = ? AND user_id = ?",
-                    (expense_id, user_id)
-                )
-                conn.commit()
-                
-                if cursor.rowcount > 0:
-                    logger.info(f"Expense {expense_id} deleted by user {user_id}")
-                    return True, "Expense deleted successfully!"
-                else:
-                    logger.warning(f"Delete attempt failed - expense {expense_id} by user {user_id}")
-                    return False, "Expense not found or access denied"
-                    
-        except Exception as e:
-            logger.error(f"Error deleting expense: {e}")
-            return False, f"Error deleting expense: {str(e)}"
-    
-    def update_expense(
-        self,
-        expense_id: int,
-        user_id: int,
-        category: Optional[str] = None,
-        amount: Optional[float] = None,
-        expense_date: Optional[date] = None,
-        description: Optional[str] = None
-    ) -> Tuple[bool, str]:
-        """
-        Update an existing expense.
-        
-        Args:
-            expense_id: Expense ID to update
-            user_id: User ID for ownership verification
-            category: New category (optional)
-            amount: New amount (optional)
-            expense_date: New date (optional)
-            description: New description (optional)
-            
-        Returns:
-            Tuple of (success, message)
-        """
-        try:
-            updates = []
-            params = []
-            
-            if category is not None:
-                updates.append("category = ?")
-                params.append(category.strip())
-            
-            if amount is not None:
-                if amount <= 0:
-                    return False, "Amount must be greater than zero"
-                updates.append("amount = ?")
-                params.append(amount)
-            
-            if expense_date is not None:
-                updates.append("date = ?")
-                params.append(expense_date.isoformat())
-            
-            if description is not None:
-                updates.append("description = ?")
-                params.append(description.strip())
-            
-            if not updates:
-                return False, "No updates provided"
-            
-            params.extend([expense_id, user_id])
-            
-            with self.db.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    f"""UPDATE expenses SET {', '.join(updates)}
-                        WHERE id = ? AND user_id = ?""",
-                    params
-                )
-                conn.commit()
-                
-                if cursor.rowcount > 0:
-                    logger.info(f"Expense {expense_id} updated by user {user_id}")
-                    return True, "Expense updated successfully!"
-                else:
-                    return False, "Expense not found or access denied"
-                    
-        except Exception as e:
-            logger.error(f"Error updating expense: {e}")
-            return False, f"Error updating expense: {str(e)}"
-    
-    @st.cache_data(ttl=300)
-    def get_user_expenses(_self, user_id: int) -> pd.DataFrame:
-        """
-        Get all expenses for a user (with caching).
-        
-        Args:
-            user_id: User ID
-            
-        Returns:
-            DataFrame of expenses
-        """
-        try:
-            with _self.db.get_connection() as conn:
-                df = pd.read_sql(
-                    """SELECT id, category, amount, date, description, created_at
-                       FROM expenses 
-                       WHERE user_id = ? 
-                       ORDER BY date DESC, created_at DESC""",
-                    conn,
-                    params=(user_id,)
-                )
-                
-                if not df.empty and 'date' in df.columns:
-                    df['date'] = pd.to_datetime(df['date'])
-                
-                return df
-                
-        except Exception as e:
-            logger.error(f"Error fetching expenses: {e}")
-            return pd.DataFrame()
-    
-    def get_expense_summary(self, user_id: int) -> Optional[ExpenseSummary]:
-        """
-        Calculate comprehensive expense statistics.
-        
-        Args:
-            user_id: User ID
-            
-        Returns:
-            ExpenseSummary object or None if no data
-        """
-        df = self.get_user_expenses(user_id)
-        
-        if df.empty or 'amount' not in df.columns:
-            return None
-        
-        try:
-            df['date'] = pd.to_datetime(df['date'])
-            today = datetime.now()
-            
-            # Calculate time-based expenses
-            current_month_mask = (
-                (df['date'].dt.month == today.month) & 
-                (df['date'].dt.year == today.year)
-            )
-            last_30_days_mask = df['date'] >= (today - timedelta(days=30))
-            last_7_days_mask = df['date'] >= (today - timedelta(days=7))
-            
-            monthly_expenses = df[current_month_mask]['amount'].sum()
-            last_30_days = df[last_30_days_mask]['amount'].sum()
-            last_7_days = df[last_7_days_mask]['amount'].sum()
-            
-            # Get top category
-            top_category = 'N/A'
-            if not df['category'].empty:
-                category_mode = df['category'].mode()
-                if not category_mode.empty:
-                    top_category = category_mode.iloc[0]
-            
-            return ExpenseSummary(
-                total_expenses=float(df['amount'].sum()),
-                average_expense=float(df['amount'].mean()),
-                expense_count=len(df),
-                top_category=top_category,
-                largest_expense=float(df['amount'].max()),
-                monthly_expenses=float(monthly_expenses),
-                last_30_days=float(last_30_days),
-                last_7_days=float(last_7_days),
-                daily_average=float(last_30_days / 30) if last_30_days > 0 else 0.0
-            )
-            
-        except Exception as e:
-            logger.error(f"Error calculating summary: {e}")
-            return None
-
-# ============================================================================
-# DATA VISUALIZATION
-# ============================================================================
-
-class ChartGenerator:
-    """Generate charts and visualizations."""
-    
-    @staticmethod
-    def format_currency(amount: float) -> str:
-        """Format amount in currency."""
-        return f"{Config.CURRENCY_SYMBOL}{amount:,.2f}"
-    
-    @staticmethod
-    def get_chart_layout() -> dict:
-        """Get common chart layout configuration."""
-        return {
-            'plot_bgcolor': 'rgba(0,0,0,0)',
-            'paper_bgcolor': 'rgba(0,0,0,0)',
-            'font': dict(color='white', size=12),
-            'hoverlabel': dict(bgcolor="white", font_size=12),
-            'margin': dict(l=20, r=20, t=40, b=20)
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SmartSpend - Expense Tracker</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <style>
+        * {
+            font-family: 'Inter', sans-serif;
         }
-    
-    @classmethod
-    def create_monthly_trend_chart(cls, df: pd.DataFrame) -> Optional[go.Figure]:
-        """Create monthly expense trend line chart."""
-        if df.empty or 'date' not in df.columns:
-            return None
         
-        try:
-            monthly = df.groupby(df['date'].dt.to_period('M')).agg({
-                'amount': 'sum',
-                'id': 'count'
-            }).reset_index()
-            
-            monthly['date'] = monthly['date'].astype(str)
-            monthly['amount_formatted'] = monthly['amount'].apply(cls.format_currency)
-            
-            fig = px.line(
-                monthly,
-                x='date',
-                y='amount',
-                title='📈 Monthly Expense Trends',
-                labels={'amount': f'Amount ({Config.CURRENCY_SYMBOL})', 'date': 'Month'},
-                line_shape='spline',
-                custom_data=['amount_formatted', 'id']
-            )
-            
-            fig.update_traces(
-                line=dict(width=4, color=ThemeColors.PRIMARY),
-                hovertemplate='<b>%{x}</b><br>Amount: %{customdata[0]}<br>Transactions: %{customdata[1]}<extra></extra>'
-            )
-            
-            fig.update_layout(**cls.get_chart_layout())
-            return fig
-            
-        except Exception as e:
-            logger.error(f"Error creating monthly trend chart: {e}")
-            return None
-    
-    @classmethod
-    def create_category_pie_chart(cls, df: pd.DataFrame) -> Optional[go.Figure]:
-        """Create category distribution pie chart."""
-        if df.empty:
-            return None
+        body {
+            background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 50%, #16213e 100%);
+            min-height: 100vh;
+        }
         
-        try:
-            category_totals = df.groupby('category')['amount'].sum().reset_index()
-            category_totals = category_totals.sort_values('amount', ascending=False)
-            category_totals['amount_formatted'] = category_totals['amount'].apply(cls.format_currency)
-            
-            fig = px.pie(
-                category_totals,
-                values='amount',
-                names='category',
-                title='🥧 Expense Distribution by Category',
-                hole=0.4,
-                custom_data=['amount_formatted']
-            )
-            
-            fig.update_traces(
-                hovertemplate='<b>%{label}</b><br>Amount: %{customdata[0]}<br>Percentage: %{percent}<extra></extra>'
-            )
-            
-            fig.update_layout(**cls.get_chart_layout())
-            return fig
-            
-        except Exception as e:
-            logger.error(f"Error creating pie chart: {e}")
-            return None
-    
-    @classmethod
-    def create_daily_expense_chart(cls, df: pd.DataFrame, days: int = 30) -> Optional[go.Figure]:
-        """Create daily expense bar chart."""
-        if df.empty or 'date' not in df.columns:
-            return None
+        .gradient-text {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
         
-        try:
-            cutoff_date = datetime.now() - timedelta(days=days)
-            recent_expenses = df[df['date'] >= cutoff_date]
-            
-            if recent_expenses.empty:
-                return None
-            
-            daily = recent_expenses.groupby(recent_expenses['date'].dt.date)['amount'].sum().reset_index()
-            daily['amount_formatted'] = daily['amount'].apply(cls.format_currency)
-            
-            fig = px.bar(
-                daily,
-                x='date',
-                y='amount',
-                title=f'📊 Daily Expenses (Last {days} Days)',
-                labels={'amount': f'Amount ({Config.CURRENCY_SYMBOL})', 'date': 'Date'},
-                custom_data=['amount_formatted']
-            )
-            
-            fig.update_traces(
-                marker_color=ThemeColors.SUCCESS,
-                hovertemplate='<b>%{x}</b><br>Amount: %{customdata[0]}<extra></extra>'
-            )
-            
-            fig.update_layout(**cls.get_chart_layout())
-            return fig
-            
-        except Exception as e:
-            logger.error(f"Error creating daily chart: {e}")
-            return None
-    
-    @classmethod
-    def create_category_bar_chart(cls, df: pd.DataFrame) -> Optional[go.Figure]:
-        """Create horizontal bar chart for categories."""
-        if df.empty:
-            return None
+        .glass-card {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
         
-        try:
-            category_totals = df.groupby('category')['amount'].sum().reset_index()
-            category_totals = category_totals.sort_values('amount', ascending=True)
-            category_totals['amount_formatted'] = category_totals['amount'].apply(cls.format_currency)
-            
-            fig = px.bar(
-                category_totals,
-                y='category',
-                x='amount',
-                title='📊 Expenses by Category',
-                labels={'amount': f'Amount ({Config.CURRENCY_SYMBOL})', 'category': 'Category'},
-                orientation='h',
-                custom_data=['amount_formatted']
-            )
-            
-            fig.update_traces(
-                marker_color=ThemeColors.INFO,
-                hovertemplate='<b>%{y}</b><br>Amount: %{customdata[0]}<extra></extra>'
-            )
-            
-            fig.update_layout(**cls.get_chart_layout())
-            return fig
-            
-        except Exception as e:
-            logger.error(f"Error creating category bar chart: {e}")
-            return None
-    
-    @classmethod
-    def create_spending_timeline(cls, df: pd.DataFrame) -> Optional[go.Figure]:
-        """Create cumulative spending timeline."""
-        if df.empty or 'date' not in df.columns:
-            return None
+        .metric-card {
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(139, 92, 246, 0.1) 100%);
+            border: 1px solid rgba(139, 92, 246, 0.2);
+            transition: all 0.3s ease;
+        }
         
-        try:
-            df_sorted = df.sort_values('date')
-            df_sorted['cumulative_amount'] = df_sorted['amount'].cumsum()
-            df_sorted['amount_formatted'] = df_sorted['amount'].apply(cls.format_currency)
-            df_sorted['cumulative_formatted'] = df_sorted['cumulative_amount'].apply(cls.format_currency)
-            
-            fig = go.Figure()
-            
-            fig.add_trace(go.Scatter(
-                x=df_sorted['date'],
-                y=df_sorted['cumulative_amount'],
-                mode='lines',
-                name='Cumulative Spending',
-                line=dict(color=ThemeColors.PRIMARY, width=3),
-                customdata=df_sorted['cumulative_formatted'],
-                hovertemplate='<b>%{x}</b><br>Cumulative: %{customdata}<extra></extra>'
-            ))
-            
-            fig.add_trace(go.Scatter(
-                x=df_sorted['date'],
-                y=df_sorted['amount'],
-                mode='markers',
-                name='Individual Expenses',
-                marker=dict(color=ThemeColors.DANGER, size=6),
-                customdata=df_sorted['amount_formatted'],
-                hovertemplate='<b>%{x}</b><br>Amount: %{customdata}<extra></extra>'
-            ))
-            
-            fig.update_layout(
-                title='📈 Cumulative Spending Timeline',
-                xaxis_title='Date',
-                yaxis_title=f'Amount ({Config.CURRENCY_SYMBOL})',
-                hovermode='x unified',
-                **cls.get_chart_layout()
-            )
-            
-            return fig
-            
-        except Exception as e:
-            logger.error(f"Error creating timeline: {e}")
-            return None
+        .metric-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 20px 40px rgba(139, 92, 246, 0.2);
+            border-color: rgba(139, 92, 246, 0.4);
+        }
+        
+        .nav-btn {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: all 0.3s ease;
+        }
+        
+        .nav-btn:hover, .nav-btn.active {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-color: transparent;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.3);
+        }
+        
+        .primary-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            transition: all 0.3s ease;
+        }
+        
+        .primary-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
+        }
+        
+        .danger-btn {
+            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+            transition: all 0.3s ease;
+        }
+        
+        .danger-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(239, 68, 68, 0.4);
+        }
+        
+        .input-field {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: all 0.3s ease;
+        }
+        
+        .input-field:focus {
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.2);
+            outline: none;
+        }
+        
+        .chart-container {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        
+        .table-row {
+            transition: all 0.2s ease;
+        }
+        
+        .table-row:hover {
+            background: rgba(102, 126, 234, 0.1);
+        }
+        
+        .fade-in {
+            animation: fadeIn 0.5s ease-out;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .slide-in {
+            animation: slideIn 0.3s ease-out;
+        }
+        
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateX(-20px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+        
+        .pulse {
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: rgba(102, 126, 234, 0.5);
+            border-radius: 4px;
+        }
+        
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(102, 126, 234, 0.7);
+        }
+        
+        .notification {
+            animation: slideNotification 0.3s ease-out;
+        }
+        
+        @keyframes slideNotification {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+    </style>
+</head>
+<body class="text-white">
+    <!-- Notification Container -->
+    <div id="notification" class="fixed top-4 right-4 z-50 hidden"></div>
 
-# ============================================================================
-# UI COMPONENTS
-# ============================================================================
-
-class UIComponents:
-    """Reusable UI components."""
-    
-    @staticmethod
-    def render_custom_css():
-        """Render custom CSS styles."""
-        st.markdown("""
-            <style>
-                .main {
-                    background-color: #0f1115;
-                    color: white;
-                }
-                .app-title {
-                    text-align: center;
-                    font-size: 3.5em; 
-                    font-weight: 900;
-                    color: transparent; 
-                    background: linear-gradient(90deg, #4f46e5, #3b82f6, #1e40af); 
-                    -webkit-background-clip: text;
-                    background-clip: text;
-                    padding: 20px 0;
-                    margin-bottom: 15px;
-                    letter-spacing: 2px;
-                    text-shadow: 0 0 30px rgba(59, 130, 246, 0.3);
-                }
-                .app-subtitle {
-                    text-align: center;
-                    color: #94a3b8;
-                    font-size: 1.1em;
-                    margin-bottom: 30px;
-                }
-                .nav-container {
-                    background: linear-gradient(135deg, #1e1e1e 0%, #2d2d2d 100%);
-                    padding: 20px;
-                    border-radius: 16px;
-                    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-                    margin-bottom: 25px;
-                    border: 1px solid #333;
-                }
-                .stButton button {
-                    background: linear-gradient(135deg, #3b82f6 0%, #1e40af 100%);
-                    color: white;
-                    font-weight: 600;
-                    border: none;
-                    border-radius: 12px;
-                    padding: 12px 24px;
-                    transition: all 0.3s ease;
-                    font-size: 15px;
-                    width: 100%;
-                    box-shadow: 0 2px 8px rgba(59, 130, 246, 0.2);
-                }
-                .stButton button:hover {
-                    transform: translateY(-2px);
-                    box-shadow: 0 6px 16px rgba(59, 130, 246, 0.4);
-                }
-                .metric-card {
-                    background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
-                    padding: 20px;
-                    border-radius: 12px;
-                    border: 1px solid #475569;
-                    text-align: center;
-                    min-height: 130px;
-                    display: flex;
-                    flex-direction: column;
-                    justify-content: center;
-                    transition: transform 0.2s ease;
-                    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-                }
-                .metric-card:hover {
-                    transform: translateY(-3px);
-                    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-                }
-                .metric-card h3 {
-                    margin-bottom: 8px;
-                    font-size: 0.85em;
-                    color: #94a3b8;
-                    font-weight: 500;
-                }
-                .metric-card h2 {
-                    font-size: 1.5em;
-                    margin: 0;
-                    color: white;
-                    font-weight: 700;
-                }
-                .user-welcome {
-                    text-align: center;
-                    background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
-                    padding: 15px;
-                    border-radius: 12px;
-                    margin-bottom: 20px;
-                    border: 1px solid #475569;
-                    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-                }
-                .chart-container {
-                    background: #1e1e1e;
-                    padding: 20px;
-                    border-radius: 12px;
-                    margin-bottom: 20px;
-                    border: 1px solid #333;
-                    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-                }
-                .auth-container {
-                    max-width: 450px;
-                    margin: 50px auto;
-                    padding: 40px;
-                    background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
-                    border-radius: 16px;
-                    border: 1px solid #475569;
-                    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-                }
-                .isolation-badge {
-                    background: #10b981;
-                    color: white;
-                    padding: 5px 14px;
-                    border-radius: 20px;
-                    font-size: 0.75em;
-                    font-weight: 700;
-                    text-transform: uppercase;
-                    letter-spacing: 0.5px;
-                }
-                .page-header {
-                    border-bottom: 2px solid #3b82f6;
-                    padding-bottom: 10px;
-                    margin-bottom: 25px;
-                }
-                .info-box {
-                    background: rgba(59, 130, 246, 0.1);
-                    border-left: 4px solid #3b82f6;
-                    padding: 15px;
-                    border-radius: 8px;
-                    margin: 15px 0;
-                }
-                .warning-box {
-                    background: rgba(245, 158, 11, 0.1);
-                    border-left: 4px solid #f59e0b;
-                    padding: 15px;
-                    border-radius: 8px;
-                    margin: 15px 0;
-                }
-                .success-box {
-                    background: rgba(16, 185, 129, 0.1);
-                    border-left: 4px solid #10b981;
-                    padding: 15px;
-                    border-radius: 8px;
-                    margin: 15px 0;
-                }
-                /* Improve form styling */
-                .stTextInput input, .stNumberInput input, .stSelectbox select {
-                    background-color: #1e293b !important;
-                    border: 1px solid #475569 !important;
-                    color: white !important;
-                    border-radius: 8px !important;
-                }
-                .stDateInput input {
-                    background-color: #1e293b !important;
-                    border: 1px solid #475569 !important;
-                    color: white !important;
-                    border-radius: 8px !important;
-                }
-                /* Data table styling */
-                .dataframe {
-                    background-color: #1e293b !important;
-                }
-            </style>
-        """, unsafe_allow_html=True)
-    
-    @staticmethod
-    def render_metric_card(title: str, value: str, icon: str = ""):
-        """Render a metric card."""
-        st.markdown(f"""
-            <div class="metric-card">
-                <h3>{icon} {title}</h3>
-                <h2>{value}</h2>
+    <!-- Auth Page -->
+    <div id="authPage" class="min-h-screen flex items-center justify-center p-4">
+        <div class="w-full max-w-md">
+            <div class="text-center mb-8 fade-in">
+                <h1 class="text-5xl font-black gradient-text mb-2">SmartSpend</h1>
+                <p class="text-gray-400">Track your expenses intelligently</p>
             </div>
-        """, unsafe_allow_html=True)
-    
-    @staticmethod
-    def render_page_header(title: str, icon: str = ""):
-        """Render a page header."""
-        st.markdown(f"""
-            <div class="page-header">
-                <h2>{icon} {title}</h2>
-            </div>
-        """, unsafe_allow_html=True)
-
-# ============================================================================
-# SESSION MANAGEMENT
-# ============================================================================
-
-class SessionManager:
-    """Manage Streamlit session state."""
-    
-    @staticmethod
-    def initialize():
-        """Initialize session state variables."""
-        if "page" not in st.session_state:
-            st.session_state.page = "Dashboard"
-        if "user_id" not in st.session_state:
-            st.session_state.user_id = None
-        if "username" not in st.session_state:
-            st.session_state.username = None
-        if "show_login" not in st.session_state:
-            st.session_state.show_login = True
-        if "show_register" not in st.session_state:
-            st.session_state.show_register = False
-        if "last_activity" not in st.session_state:
-            st.session_state.last_activity = datetime.now()
-    
-    @staticmethod
-    def is_authenticated() -> bool:
-        """Check if user is authenticated."""
-        return st.session_state.user_id is not None
-    
-    @staticmethod
-    def logout():
-        """Clear session and logout user."""
-        st.session_state.user_id = None
-        st.session_state.username = None
-        st.session_state.show_login = True
-        st.session_state.page = "Dashboard"
-        logger.info("User logged out")
-    
-    @staticmethod
-    def check_session_timeout():
-        """Check if session has timed out."""
-        if SessionManager.is_authenticated():
-            last_activity = st.session_state.get('last_activity', datetime.now())
-            if datetime.now() - last_activity > timedelta(minutes=Config.SESSION_TIMEOUT_MINUTES):
-                SessionManager.logout()
-                return True
-        return False
-    
-    @staticmethod
-    def update_activity():
-        """Update last activity timestamp."""
-        st.session_state.last_activity = datetime.now()
-
-# ============================================================================
-# APPLICATION PAGES
-# ============================================================================
-
-class AuthPage:
-    """Authentication page (login/register)."""
-    
-    def __init__(self, user_manager: UserManager):
-        """Initialize auth page with user manager."""
-        self.user_manager = user_manager
-    
-    def render(self):
-        """Render authentication page."""
-        st.markdown(f"""
-            <h1 class='app-title'>{Config.APP_NAME}</h1>
-            <p class='app-subtitle'>Professional Expense Tracking & Analytics</p>
-        """, unsafe_allow_html=True)
-        
-        if st.session_state.show_register:
-            self.render_register_form()
-        else:
-            self.render_login_form()
-    
-    def render_login_form(self):
-        """Render login form."""
-        st.markdown("<div class='auth-container'>", unsafe_allow_html=True)
-        st.subheader("🔐 Login to Your Account")
-        
-        with st.form("login_form", clear_on_submit=False):
-            username = st.text_input("Username", placeholder="Enter your username")
-            password = st.text_input("Password", type="password", placeholder="Enter your password")
             
-            col1, col2 = st.columns(2)
-            with col1:
-                login_btn = st.form_submit_button("🚀 Login", type="primary", use_container_width=True)
-            with col2:
-                register_btn = st.form_submit_button("📝 Create Account", use_container_width=True)
-            
-            if login_btn:
-                if username and password:
-                    with st.spinner("Authenticating..."):
-                        user_id = self.user_manager.authenticate_user(username, password)
-                        if user_id:
-                            st.session_state.user_id = user_id
-                            st.session_state.username = username
-                            st.session_state.show_login = False
-                            SessionManager.update_activity()
-                            st.success("✅ Login successful!")
-                            st.rerun()
-                        else:
-                            st.error("❌ Invalid username or password")
-                else:
-                    st.error("⚠️ Please fill in all fields")
-            
-            if register_btn:
-                st.session_state.show_register = True
-                st.rerun()
-        
-        st.markdown("</div>", unsafe_allow_html=True)
-    
-    def render_register_form(self):
-        """Render registration form."""
-        st.markdown("<div class='auth-container'>", unsafe_allow_html=True)
-        st.subheader("🚀 Create Your Account")
-        
-        st.markdown("""
-            <div class='info-box'>
-                <strong>Password Requirements:</strong>
-                <ul style='margin: 5px 0 0 20px; font-size: 0.9em;'>
-                    <li>At least 8 characters long</li>
-                    <li>Contains uppercase and lowercase letters</li>
-                    <li>Contains at least one number</li>
-                </ul>
-            </div>
-        """, unsafe_allow_html=True)
-        
-        with st.form("register_form", clear_on_submit=True):
-            username = st.text_input("Username", placeholder="Choose a username (min 3 characters)")
-            email = st.text_input("Email (Optional)", placeholder="your.email@example.com")
-            password = st.text_input("Password", type="password", placeholder="Create a strong password")
-            confirm_password = st.text_input("Confirm Password", type="password", placeholder="Re-enter your password")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                create_btn = st.form_submit_button("✨ Create Account", type="primary", use_container_width=True)
-            with col2:
-                back_btn = st.form_submit_button("← Back to Login", use_container_width=True)
-            
-            if create_btn:
-                if username and password:
-                    if password == confirm_password:
-                        with st.spinner("Creating account..."):
-                            success, message = self.user_manager.create_user(username, password, email)
-                            if success:
-                                st.success(f"✅ {message} Please login.")
-                                st.session_state.show_register = False
-                                st.balloons()
-                                st.rerun()
-                            else:
-                                st.error(f"❌ {message}")
-                    else:
-                        st.error("❌ Passwords do not match")
-                else:
-                    st.error("⚠️ Please fill in all required fields")
-            
-            if back_btn:
-                st.session_state.show_register = False
-                st.rerun()
-        
-        st.markdown("</div>", unsafe_allow_html=True)
-
-
-class DashboardPage:
-    """Main dashboard page."""
-    
-    def __init__(self, expense_manager: ExpenseManager, chart_generator: ChartGenerator):
-        """Initialize dashboard with managers."""
-        self.expense_manager = expense_manager
-        self.chart_generator = chart_generator
-    
-    def render(self):
-        """Render dashboard page."""
-        UIComponents.render_page_header("Dashboard Overview", "📊")
-        
-        user_id = st.session_state.user_id
-        df = self.expense_manager.get_user_expenses(user_id)
-        summary = self.expense_manager.get_expense_summary(user_id)
-        
-        if summary and not df.empty:
-            self.render_metrics(summary)
-            self.render_charts(df)
-        else:
-            st.markdown("""
-                <div class='info-box'>
-                    <h3>🎯 Welcome to SmartSpend!</h3>
-                    <p>You haven't recorded any expenses yet. Start by adding your first expense to see powerful analytics and insights.</p>
+            <!-- Login Form -->
+            <div id="loginForm" class="glass-card rounded-2xl p-8 fade-in">
+                <div class="flex items-center gap-3 mb-6">
+                    <div class="w-10 h-10 rounded-full bg-gradient-to-r from-indigo-500 to-purple-500 flex items-center justify-center">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+                        </svg>
+                    </div>
+                    <h2 class="text-2xl font-bold">Welcome Back</h2>
                 </div>
-            """, unsafe_allow_html=True)
-            
-            if st.button("➕ Add Your First Expense", type="primary"):
-                st.session_state.page = "Add Expense"
-                st.rerun()
-    
-    def render_metrics(self, summary: ExpenseSummary):
-        """Render metric cards."""
-        st.subheader("📈 Key Metrics")
-        
-        # Row 1
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            UIComponents.render_metric_card(
-                "Total Spent",
-                ChartGenerator.format_currency(summary.total_expenses),
-                "💰"
-            )
-        with col2:
-            UIComponents.render_metric_card(
-                "This Month",
-                ChartGenerator.format_currency(summary.monthly_expenses),
-                "📅"
-            )
-        with col3:
-            UIComponents.render_metric_card(
-                "Transactions",
-                str(summary.expense_count),
-                "📝"
-            )
-        with col4:
-            UIComponents.render_metric_card(
-                "Daily Average",
-                ChartGenerator.format_currency(summary.daily_average),
-                "📊"
-            )
-        
-        # Row 2
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            UIComponents.render_metric_card(
-                "Last 7 Days",
-                ChartGenerator.format_currency(summary.last_7_days),
-                "🔥"
-            )
-        with col2:
-            UIComponents.render_metric_card(
-                "Last 30 Days",
-                ChartGenerator.format_currency(summary.last_30_days),
-                "📆"
-            )
-        with col3:
-            UIComponents.render_metric_card(
-                "Average Expense",
-                ChartGenerator.format_currency(summary.average_expense),
-                "💵"
-            )
-        with col4:
-            UIComponents.render_metric_card(
-                "Top Category",
-                summary.top_category,
-                "🏆"
-            )
-    
-    def render_charts(self, df: pd.DataFrame):
-        """Render analytics charts."""
-        st.subheader("📊 Visual Analytics")
-        
-        # Row 1: Monthly Trend & Category Distribution
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("<div class='chart-container'>", unsafe_allow_html=True)
-            chart = self.chart_generator.create_monthly_trend_chart(df)
-            if chart:
-                st.plotly_chart(chart, use_container_width=True)
-            else:
-                st.info("Insufficient data for monthly trends")
-            st.markdown("</div>", unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown("<div class='chart-container'>", unsafe_allow_html=True)
-            chart = self.chart_generator.create_category_pie_chart(df)
-            if chart:
-                st.plotly_chart(chart, use_container_width=True)
-            else:
-                st.info("Insufficient data for category distribution")
-            st.markdown("</div>", unsafe_allow_html=True)
-        
-        # Row 2: Category Breakdown & Daily Expenses
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("<div class='chart-container'>", unsafe_allow_html=True)
-            chart = self.chart_generator.create_category_bar_chart(df)
-            if chart:
-                st.plotly_chart(chart, use_container_width=True)
-            else:
-                st.info("Insufficient data for category breakdown")
-            st.markdown("</div>", unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown("<div class='chart-container'>", unsafe_allow_html=True)
-            chart = self.chart_generator.create_daily_expense_chart(df)
-            if chart:
-                st.plotly_chart(chart, use_container_width=True)
-            else:
-                st.info("No expenses in the last 30 days")
-            st.markdown("</div>", unsafe_allow_html=True)
-        
-        # Row 3: Spending Timeline
-        st.markdown("<div class='chart-container'>", unsafe_allow_html=True)
-        chart = self.chart_generator.create_spending_timeline(df)
-        if chart:
-            st.plotly_chart(chart, use_container_width=True)
-        else:
-            st.info("Insufficient data for spending timeline")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-
-class AddExpensePage:
-    """Add expense page."""
-    
-    def __init__(self, expense_manager: ExpenseManager):
-        """Initialize with expense manager."""
-        self.expense_manager = expense_manager
-    
-    def render(self):
-        """Render add expense page."""
-        UIComponents.render_page_header("Add New Expense", "➕")
-        
-        st.markdown("""
-            <div class='info-box'>
-                Record your expenses to track spending patterns and gain insights into your financial habits.
-            </div>
-        """, unsafe_allow_html=True)
-        
-        with st.form("add_expense_form", clear_on_submit=True):
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                category = st.selectbox(
-                    "Category *",
-                    ExpenseCategory.get_list(),
-                    index=0,
-                    help="Select the category that best describes this expense"
-                )
-                amount = st.number_input(
-                    f"Amount ({Config.CURRENCY_SYMBOL}) *",
-                    min_value=0.01,
-                    step=0.01,
-                    format="%.2f",
-                    help="Enter the expense amount"
-                )
-            
-            with col2:
-                expense_date = st.date_input(
-                    "Date *",
-                    value=date.today(),
-                    max_value=date.today(),
-                    help="Select the date of expense"
-                )
-                description = st.text_input(
-                    "Description (Optional)",
-                    placeholder="e.g., Lunch at restaurant",
-                    help="Add a brief description"
-                )
-            
-            submitted = st.form_submit_button("💾 Add Expense", type="primary", use_container_width=True)
-            
-            if submitted:
-                if category and amount > 0 and expense_date:
-                    with st.spinner("Adding expense..."):
-                        success, message = self.expense_manager.add_expense(
-                            st.session_state.user_id,
-                            category,
-                            amount,
-                            expense_date,
-                            description
-                        )
-                        if success:
-                            st.success(f"✅ {message}")
-                            st.balloons()
-                            
-                            # Clear cache to refresh data
-                            st.cache_data.clear()
-                            
-                            if st.button("📊 View Dashboard"):
-                                st.session_state.page = "Dashboard"
-                                st.rerun()
-                        else:
-                            st.error(f"❌ {message}")
-                else:
-                    st.error("⚠️ Please fill in all required fields correctly")
-
-
-class ViewExpensesPage:
-    """View all expenses page."""
-    
-    def __init__(self, expense_manager: ExpenseManager):
-        """Initialize with expense manager."""
-        self.expense_manager = expense_manager
-    
-    def render(self):
-        """Render view expenses page."""
-        UIComponents.render_page_header("All Expenses", "📋")
-        
-        user_id = st.session_state.user_id
-        df = self.expense_manager.get_user_expenses(user_id)
-        
-        if df.empty:
-            st.markdown("""
-                <div class='info-box'>
-                    <p>No expenses found. Start tracking by adding your first expense!</p>
+                
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-300 mb-2">Username</label>
+                        <input type="text" id="loginUsername" class="input-field w-full px-4 py-3 rounded-xl text-white placeholder-gray-500" placeholder="Enter your username">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-300 mb-2">Password</label>
+                        <input type="password" id="loginPassword" class="input-field w-full px-4 py-3 rounded-xl text-white placeholder-gray-500" placeholder="Enter your password">
+                    </div>
+                    <button onclick="login()" class="primary-btn w-full py-3 rounded-xl font-semibold text-white mt-4">
+                        Sign In
+                    </button>
                 </div>
-            """, unsafe_allow_html=True)
-            return
-        
-        # Filter options
-        with st.expander("🔍 Filter Options", expanded=False):
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                categories = ['All'] + ExpenseCategory.get_list()
-                selected_category = st.selectbox("Category", categories)
-            
-            with col2:
-                date_from = st.date_input("From Date", value=None)
-            
-            with col3:
-                date_to = st.date_input("To Date", value=None)
-        
-        # Apply filters
-        filtered_df = df.copy()
-        
-        if selected_category != 'All':
-            filtered_df = filtered_df[filtered_df['category'] == selected_category]
-        
-        if date_from:
-            filtered_df = filtered_df[filtered_df['date'] >= pd.to_datetime(date_from)]
-        
-        if date_to:
-            filtered_df = filtered_df[filtered_df['date'] <= pd.to_datetime(date_to)]
-        
-        # Display summary
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Total Records", len(filtered_df))
-        with col2:
-            st.metric("Total Amount", ChartGenerator.format_currency(filtered_df['amount'].sum() if not filtered_df.empty else 0))
-        with col3:
-            st.metric("Average", ChartGenerator.format_currency(filtered_df['amount'].mean() if not filtered_df.empty else 0))
-        
-        # Display table
-        if not filtered_df.empty:
-            display_df = filtered_df.copy()
-            display_df['date'] = display_df['date'].dt.strftime(Config.DATE_FORMAT)
-            display_df['amount'] = display_df['amount'].apply(ChartGenerator.format_currency)
-            
-            # Select columns to display
-            columns_to_show = ['date', 'category', 'description', 'amount']
-            
-            st.dataframe(
-                display_df[columns_to_show],
-                use_container_width=True,
-                hide_index=True,
-                height=400
-            )
-            
-            # Export option
-            csv = display_df[columns_to_show].to_csv(index=False)
-            st.download_button(
-                label="📥 Download as CSV",
-                data=csv,
-                file_name=f"expenses_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv"
-            )
-        else:
-            st.info("No expenses match the selected filters")
-
-
-class DeleteExpensePage:
-    """Delete expense page."""
-    
-    def __init__(self, expense_manager: ExpenseManager):
-        """Initialize with expense manager."""
-        self.expense_manager = expense_manager
-    
-    def render(self):
-        """Render delete expense page."""
-        UIComponents.render_page_header("Delete Expense", "❌")
-        
-        st.markdown("""
-            <div class='warning-box'>
-                <strong>⚠️ Warning:</strong> Deleting an expense is permanent and cannot be undone.
+                
+                <div class="mt-6 text-center">
+                    <p class="text-gray-400">Don't have an account? 
+                        <button onclick="showRegister()" class="text-indigo-400 hover:text-indigo-300 font-medium">Create one</button>
+                    </p>
+                </div>
             </div>
-        """, unsafe_allow_html=True)
-        
-        user_id = st.session_state.user_id
-        df = self.expense_manager.get_user_expenses(user_id)
-        
-        if df.empty:
-            st.info("No expenses to delete")
-            return
-        
-        # Create display dataframe
-        display_df = df.copy()
-        display_df['date'] = display_df['date'].dt.strftime(Config.DATE_FORMAT)
-        display_df['amount'] = display_df['amount'].apply(ChartGenerator.format_currency)
-        display_df['label'] = (
-            display_df['date'] + " | " +
-            display_df['category'] + " | " +
-            display_df['amount'] +
-            (" | " + display_df['description'] if 'description' in display_df.columns else "")
-        )
-        
-        # Selection
-        expense_to_delete = st.selectbox(
-            "Select an expense to delete",
-            options=display_df['id'].tolist(),
-            format_func=lambda x: display_df[display_df['id'] == x]['label'].iloc[0]
-        )
-        
-        # Show details of selected expense
-        if expense_to_delete:
-            selected = display_df[display_df['id'] == expense_to_delete].iloc[0]
             
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Date", selected['date'])
-            with col2:
-                st.metric("Category", selected['category'])
-            with col3:
-                st.metric("Amount", selected['amount'])
-            with col4:
-                st.metric("Description", selected.get('description', 'N/A'))
-        
-        # Confirmation
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            if st.button("🗑️ Delete", type="primary", use_container_width=True):
-                with st.spinner("Deleting..."):
-                    success, message = self.expense_manager.delete_expense(
-                        expense_to_delete,
-                        user_id
-                    )
-                    if success:
-                        st.success(f"✅ {message}")
-                        st.cache_data.clear()
-                        st.rerun()
-                    else:
-                        st.error(f"❌ {message}")
-
-
-# ============================================================================
-# MAIN APPLICATION
-# ============================================================================
-
-class SmartSpendApp:
-    """Main application class."""
-    
-    def __init__(self):
-        """Initialize application."""
-        # Configure Streamlit
-        st.set_page_config(
-            page_title=f"{Config.APP_NAME} - Professional Expense Tracker",
-            page_icon="💰",
-            layout="wide",
-            initial_sidebar_state="collapsed"
-        )
-        
-        # Initialize managers
-        self.db_manager = DatabaseManager()
-        self.user_manager = UserManager(self.db_manager)
-        self.expense_manager = ExpenseManager(self.db_manager)
-        self.chart_generator = ChartGenerator()
-        
-        # Initialize session
-        SessionManager.initialize()
-        
-        # Initialize database
-        self.db_manager.initialize_schema()
-        
-        # Apply custom CSS
-        UIComponents.render_custom_css()
-    
-    def render_navigation(self):
-        """Render navigation menu."""
-        st.markdown(f"""
-            <div class="user-welcome">
-                <h3>👋 Welcome back, <strong>{st.session_state.username}</strong>! 
-                <span class="isolation-badge">🔒 Secure Session</span></h3>
+            <!-- Register Form -->
+            <div id="registerForm" class="glass-card rounded-2xl p-8 hidden fade-in">
+                <div class="flex items-center gap-3 mb-6">
+                    <div class="w-10 h-10 rounded-full bg-gradient-to-r from-green-500 to-emerald-500 flex items-center justify-center">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z"/>
+                        </svg>
+                    </div>
+                    <h2 class="text-2xl font-bold">Create Account</h2>
+                </div>
+                
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-300 mb-2">Username</label>
+                        <input type="text" id="regUsername" class="input-field w-full px-4 py-3 rounded-xl text-white placeholder-gray-500" placeholder="Choose a username">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-300 mb-2">Email (optional)</label>
+                        <input type="email" id="regEmail" class="input-field w-full px-4 py-3 rounded-xl text-white placeholder-gray-500" placeholder="your@email.com">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-300 mb-2">Password</label>
+                        <input type="password" id="regPassword" class="input-field w-full px-4 py-3 rounded-xl text-white placeholder-gray-500" placeholder="Minimum 6 characters">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-300 mb-2">Confirm Password</label>
+                        <input type="password" id="regConfirmPassword" class="input-field w-full px-4 py-3 rounded-xl text-white placeholder-gray-500" placeholder="Confirm your password">
+                    </div>
+                    <button onclick="register()" class="primary-btn w-full py-3 rounded-xl font-semibold text-white mt-4">
+                        Create Account
+                    </button>
+                </div>
+                
+                <div class="mt-6 text-center">
+                    <p class="text-gray-400">Already have an account? 
+                        <button onclick="showLogin()" class="text-indigo-400 hover:text-indigo-300 font-medium">Sign in</button>
+                    </p>
+                </div>
             </div>
-        """, unsafe_allow_html=True)
-        
-        st.markdown("<div class='nav-container'>", unsafe_allow_html=True)
-        col1, col2, col3, col4, col5 = st.columns(5)
-        
-        with col1:
-            if st.button("📊 Dashboard", use_container_width=True):
-                st.session_state.page = "Dashboard"
-                st.rerun()
-        
-        with col2:
-            if st.button("➕ Add Expense", use_container_width=True):
-                st.session_state.page = "Add Expense"
-                st.rerun()
-        
-        with col3:
-            if st.button("📋 View All", use_container_width=True):
-                st.session_state.page = "View All"
-                st.rerun()
-        
-        with col4:
-            if st.button("❌ Delete Expense", use_container_width=True):
-                st.session_state.page = "Delete Expense"
-                st.rerun()
-        
-        with col5:
-            if st.button("🚪 Logout", use_container_width=True):
-                SessionManager.logout()
-                st.rerun()
-        
-        st.markdown("</div>", unsafe_allow_html=True)
-    
-    def run(self):
-        """Run the application."""
-        # Check session timeout
-        if SessionManager.check_session_timeout():
-            st.warning("⏰ Session expired. Please login again.")
-            st.rerun()
-        
-        # Update activity
-        SessionManager.update_activity()
-        
-        # Render appropriate page
-        if not SessionManager.is_authenticated():
-            auth_page = AuthPage(self.user_manager)
-            auth_page.render()
-        else:
-            self.render_navigation()
-            
-            # Route to appropriate page
-            if st.session_state.page == "Dashboard":
-                page = DashboardPage(self.expense_manager, self.chart_generator)
-            elif st.session_state.page == "Add Expense":
-                page = AddExpensePage(self.expense_manager)
-            elif st.session_state.page == "View All":
-                page = ViewExpensesPage(self.expense_manager)
-            elif st.session_state.page == "Delete Expense":
-                page = DeleteExpensePage(self.expense_manager)
-            else:
-                page = DashboardPage(self.expense_manager, self.chart_generator)
-            
-            page.render()
-        
-        # Footer
-        st.markdown("---")
-        st.markdown(f"""
-            <div style='text-align: center; color: #64748b; font-size: 0.85em; padding: 10px;'>
-                {Config.APP_NAME} v{Config.APP_VERSION} | Professional Expense Tracking System<br>
-                Made with ❤️ using Streamlit | © 2024 All Rights Reserved
+        </div>
+    </div>
+
+    <!-- Main App -->
+    <div id="mainApp" class="hidden min-h-screen">
+        <!-- Header -->
+        <header class="glass-card border-b border-white/10 sticky top-0 z-40">
+            <div class="max-w-7xl mx-auto px-4 py-4">
+                <div class="flex items-center justify-between">
+                    <div class="flex items-center gap-4">
+                        <h1 class="text-2xl font-bold gradient-text">SmartSpend</h1>
+                        <span class="hidden sm:inline-flex items-center gap-1 px-3 py-1 rounded-full bg-emerald-500/20 text-emerald-400 text-sm font-medium">
+                            <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+                                <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"/>
+                            </svg>
+                            Private Space
+                        </span>
+                    </div>
+                    <div class="flex items-center gap-4">
+                        <div class="hidden sm:flex items-center gap-2 text-gray-300">
+                            <div class="w-8 h-8 rounded-full bg-gradient-to-r from-indigo-500 to-purple-500 flex items-center justify-center text-sm font-bold" id="userAvatar">U</div>
+                            <span id="welcomeUser" class="font-medium">User</span>
+                        </div>
+                        <button onclick="logout()" class="danger-btn px-4 py-2 rounded-xl font-medium text-sm flex items-center gap-2">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
+                            </svg>
+                            <span class="hidden sm:inline">Logout</span>
+                        </button>
+                    </div>
+                </div>
             </div>
-        """, unsafe_allow_html=True)
+        </header>
 
+        <!-- Navigation -->
+        <nav class="max-w-7xl mx-auto px-4 py-6">
+            <div class="flex flex-wrap justify-center gap-3">
+                <button onclick="showPage('dashboard')" class="nav-btn active px-6 py-3 rounded-xl font-medium flex items-center gap-2" data-page="dashboard">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+                    </svg>
+                    Dashboard
+                </button>
+                <button onclick="showPage('add')" class="nav-btn px-6 py-3 rounded-xl font-medium flex items-center gap-2" data-page="add">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"/>
+                    </svg>
+                    Add Expense
+                </button>
+                <button onclick="showPage('view')" class="nav-btn px-6 py-3 rounded-xl font-medium flex items-center gap-2" data-page="view">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+                    </svg>
+                    View All
+                </button>
+                <button onclick="showPage('delete')" class="nav-btn px-6 py-3 rounded-xl font-medium flex items-center gap-2" data-page="delete">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                    </svg>
+                    Delete
+                </button>
+            </div>
+        </nav>
 
-# ============================================================================
-# APPLICATION ENTRY POINT
-# ============================================================================
+        <!-- Content -->
+        <main class="max-w-7xl mx-auto px-4 pb-12">
+            <!-- Dashboard Page -->
+            <div id="dashboardPage" class="fade-in">
+                <!-- Metrics Grid -->
+                <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+                    <div class="metric-card rounded-2xl p-5">
+                        <div class="flex items-center gap-3 mb-3">
+                            <div class="w-10 h-10 rounded-xl bg-indigo-500/20 flex items-center justify-center">
+                                <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                                </svg>
+                            </div>
+                            <span class="text-gray-400 text-sm font-medium">Total Spent</span>
+                        </div>
+                        <p class="text-2xl font-bold text-white" id="metricTotal">₹0.00</p>
+                    </div>
+                    
+                    <div class="metric-card rounded-2xl p-5">
+                        <div class="flex items-center gap-3 mb-3">
+                            <div class="w-10 h-10 rounded-xl bg-purple-500/20 flex items-center justify-center">
+                                <svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+                                </svg>
+                            </div>
+                            <span class="text-gray-400 text-sm font-medium">This Month</span>
+                        </div>
+                        <p class="text-2xl font-bold text-white" id="metricMonth">₹0.00</p>
+                    </div>
+                    
+                    <div class="metric-card rounded-2xl p-5">
+                        <div class="flex items-center gap-3 mb-3">
+                            <div class="w-10 h-10 rounded-xl bg-emerald-500/20 flex items-center justify-center">
+                                <svg class="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"/>
+                                </svg>
+                            </div>
+                            <span class="text-gray-400 text-sm font-medium">Transactions</span>
+                        </div>
+                        <p class="text-2xl font-bold text-white" id="metricCount">0</p>
+                    </div>
+                    
+                    <div class="metric-card rounded-2xl p-5">
+                        <div class="flex items-center gap-3 mb-3">
+                            <div class="w-10 h-10 rounded-xl bg-amber-500/20 flex items-center justify-center">
+                                <svg class="w-5 h-5 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"/>
+                                </svg>
+                            </div>
+                            <span class="text-gray-400 text-sm font-medium">Daily Average</span>
+                        </div>
+                        <p class="text-2xl font-bold text-white" id="metricAvg">₹0.00</p>
+                    </div>
+                </div>
+                
+                <!-- Second Row Metrics -->
+                <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+                    <div class="metric-card rounded-2xl p-5">
+                        <div class="flex items-center gap-3 mb-3">
+                            <div class="w-10 h-10 rounded-xl bg-rose-500/20 flex items-center justify-center">
+                                <svg class="w-5 h-5 text-rose-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 18.657A8 8 0 016.343 7.343S7 9 9 10c0-2 .5-5 2.986-7C14 5 16.09 5.777 17.656 7.343A7.975 7.975 0 0120 13a7.975 7.975 0 01-2.343 5.657z"/>
+                                </svg>
+                            </div>
+                            <span class="text-gray-400 text-sm font-medium">Last 7 Days</span>
+                        </div>
+                        <p class="text-2xl font-bold text-white" id="metric7Days">₹0.00</p>
+                    </div>
+                    
+                    <div class="metric-card rounded-2xl p-5">
+                        <div class="flex items-center gap-3 mb-3">
+                            <div class="w-10 h-10 rounded-xl bg-cyan-500/20 flex items-center justify-center">
+                                <svg class="w-5 h-5 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+                                </svg>
+                            </div>
+                            <span class="text-gray-400 text-sm font-medium">Last 30 Days</span>
+                        </div>
+                        <p class="text-2xl font-bold text-white" id="metric30Days">₹0.00</p>
+                    </div>
+                    
+                    <div class="metric-card rounded-2xl p-5">
+                        <div class="flex items-center gap-3 mb-3">
+                            <div class="w-10 h-10 rounded-xl bg-pink-500/20 flex items-center justify-center">
+                                <svg class="w-5 h-5 text-pink-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 14h.01M12 14h.01M15 11h.01M12 11h.01M9 11h.01M7 21h10a2 2 0 002-2V5a2 2 0 00-2-2H7a2 2 0 00-2 2v14a2 2 0 002 2z"/>
+                                </svg>
+                            </div>
+                            <span class="text-gray-400 text-sm font-medium">Avg Expense</span>
+                        </div>
+                        <p class="text-2xl font-bold text-white" id="metricAvgExpense">₹0.00</p>
+                    </div>
+                    
+                    <div class="metric-card rounded-2xl p-5">
+                        <div class="flex items-center gap-3 mb-3">
+                            <div class="w-10 h-10 rounded-xl bg-teal-500/20 flex items-center justify-center">
+                                <svg class="w-5 h-5 text-teal-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4M7.835 4.697a3.42 3.42 0 001.946-.806 3.42 3.42 0 014.438 0 3.42 3.42 0 001.946.806 3.42 3.42 0 013.138 3.138 3.42 3.42 0 00.806 1.946 3.42 3.42 0 010 4.438 3.42 3.42 0 00-.806 1.946 3.42 3.42 0 01-3.138 3.138 3.42 3.42 0 00-1.946.806 3.42 3.42 0 01-4.438 0 3.42 3.42 0 00-1.946-.806 3.42 3.42 0 01-3.138-3.138 3.42 3.42 0 00-.806-1.946 3.42 3.42 0 010-4.438 3.42 3.42 0 00.806-1.946 3.42 3.42 0 013.138-3.138z"/>
+                                </svg>
+                            </div>
+                            <span class="text-gray-400 text-sm font-medium">Top Category</span>
+                        </div>
+                        <p class="text-xl font-bold text-white truncate" id="metricTopCat">N/A</p>
+                    </div>
+                </div>
+                
+                <!-- Charts -->
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+                    <div class="chart-container rounded-2xl p-6">
+                        <h3 class="text-lg font-semibold mb-4 flex items-center gap-2">
+                            <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z"/>
+                            </svg>
+                            Monthly Trends
+                        </h3>
+                        <canvas id="monthlyChart" height="250"></canvas>
+                    </div>
+                    
+                    <div class="chart-container rounded-2xl p-6">
+                        <h3 class="text-lg font-semibold mb-4 flex items-center gap-2">
+                            <svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z"/>
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z"/>
+                            </svg>
+                            Category Distribution
+                        </h3>
+                        <canvas id="categoryChart" height="250"></canvas>
+                    </div>
+                </div>
+                
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <div class="chart-container rounded-2xl p-6">
+                        <h3 class="text-lg font-semibold mb-4 flex items-center gap-2">
+                            <svg class="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+                            </svg>
+                            Daily Expenses (Last 30 Days)
+                        </h3>
+                        <canvas id="dailyChart" height="250"></canvas>
+                    </div>
+                    
+                    <div class="chart-container rounded-2xl p-6">
+                        <h3 class="text-lg font-semibold mb-4 flex items-center gap-2">
+                            <svg class="w-5 h-5 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/>
+                            </svg>
+                            Expenses by Category
+                        </h3>
+                        <canvas id="categoryBarChart" height="250"></canvas>
+                    </div>
+                </div>
+                
+                <!-- Empty State -->
+                <div id="emptyDashboard" class="hidden text-center py-16">
+                    <div class="w-24 h-24 mx-auto mb-6 rounded-full bg-indigo-500/20 flex items-center justify-center">
+                        <svg class="w-12 h-12 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"/>
+                        </svg>
+                    </div>
+                    <h3 class="text-2xl font-bold mb-2">No expenses yet</h3>
+                    <p class="text-gray-400 mb-6">Start tracking your spending by adding your first expense</p>
+                    <button onclick="showPage('add')" class="primary-btn px-6 py-3 rounded-xl font-semibold">
+                        Add Your First Expense
+                    </button>
+                </div>
+            </div>
 
-if __name__ == "__main__":
-    try:
-        app = SmartSpendApp()
-        app.run()
-    except Exception as e:
-        logger.critical(f"Application crashed: {e}", exc_info=True)
-        st.error(f"⚠️ An unexpected error occurred. Please contact support.")
-        st.error(f"Error details: {str(e)}")
+            <!-- Add Expense Page -->
+            <div id="addPage" class="hidden fade-in">
+                <div class="max-w-2xl mx-auto">
+                    <div class="glass-card rounded-2xl p-8">
+                        <div class="flex items-center gap-3 mb-8">
+                            <div class="w-12 h-12 rounded-xl bg-gradient-to-r from-indigo-500 to-purple-500 flex items-center justify-center">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"/>
+                                </svg>
+                            </div>
+                            <div>
+                                <h2 class="text-2xl font-bold">Add New Expense</h2>
+                                <p class="text-gray-400 text-sm">Track your spending</p>
+                            </div>
+                        </div>
+                        
+                        <form id="addExpenseForm" class="space-y-6">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-300 mb-2">Category</label>
+                                    <select id="expenseCategory" class="input-field w-full px-4 py-3 rounded-xl text-white" required>
+                                        <option value="">Select category</option>
+                                        <option value="Food">🍔 Food</option>
+                                        <option value="Transport">🚗 Transport</option>
+                                        <option value="Shopping">🛍️ Shopping</option>
+                                        <option value="Bills">📄 Bills</option>
+                                        <option value="Entertainment">🎬 Entertainment</option>
+                                        <option value="Healthcare">🏥 Healthcare</option>
+                                        <option value="Other">📦 Other</option>
+                                    </select>
+                                </div>
+                                
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-300 mb-2">Amount (₹)</label>
+                                    <input type="number" id="expenseAmount" step="0.01" min="0.01" class="input-field w-full px-4 py-3 rounded-xl text-white" placeholder="0.00" required>
+                                </div>
+                            </div>
+                            
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-300 mb-2">Date</label>
+                                    <input type="date" id="expenseDate" class="input-field w-full px-4 py-3 rounded-xl text-white" required>
+                                </div>
+                                
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-300 mb-2">Description (optional)</label>
+                                    <input type="text" id="expenseDesc" class="input-field w-full px-4 py-3 rounded-xl text-white" placeholder="Enter description">
+                                </div>
+                            </div>
+                            
+                            <button type="submit" class="primary-btn w-full py-4 rounded-xl font-semibold text-lg flex items-center justify-center gap-2">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"/>
+                                </svg>
+                                Add Expense
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
+            <!-- View All Page -->
+            <div id="viewPage" class="hidden fade-in">
+                <div class="glass-card rounded-2xl overflow-hidden">
+                    <div class="p-6 border-b border-white/10">
+                        <div class="flex items-center justify-between">
+                            <div class="flex items-center gap-3">
+                                <div class="w-10 h-10 rounded-xl bg-gradient-to-r from-indigo-500 to-purple-500 flex items-center justify-center">
+                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+                                    </svg>
+                                </div>
+                                <div>
+                                    <h2 class="text-xl font-bold">All Expenses</h2>
+                                    <p class="text-gray-400 text-sm" id="expenseCountText">0 expenses</p>
+                                </div>
+                            </div>
+                            <div class="flex gap-2">
+                                <input type="text" id="searchExpenses" class="input-field px-4 py-2 rounded-xl text-white text-sm" placeholder="Search...">
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="overflow-x-auto">
+                        <table class="w-full">
+                            <thead class="bg-white/5">
+                                <tr>
+                                    <th class="px-6 py-4 text-left text-sm font-semibold text-gray-300">Date</th>
+                                    <th class="px-6 py-4 text-left text-sm font-semibold text-gray-300">Category</th>
+                                    <th class="px-6 py-4 text-left text-sm font-semibold text-gray-300">Description</th>
+                                    <th class="px-6 py-4 text-right text-sm font-semibold text-gray-300">Amount</th>
+                                </tr>
+                            </thead>
+                            <tbody id="expenseTableBody" class="divide-y divide-white/5">
+                                <!-- Expenses will be inserted here -->
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <div id="emptyViewState" class="hidden p-12 text-center">
+                        <svg class="w-16 h-16 mx-auto mb-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+                        </svg>
+                        <p class="text-gray-400">No expenses found</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Delete Page -->
+            <div id="deletePage" class="hidden fade-in">
+                <div class="max-w-2xl mx-auto">
+                    <div class="glass-card rounded-2xl p-8">
+                        <div class="flex items-center gap-3 mb-8">
+                            <div class="w-12 h-12 rounded-xl bg-gradient-to-r from-red-500 to-rose-500 flex items-center justify-center">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                                </svg>
+                            </div>
+                            <div>
+                                <h2 class="text-2xl font-bold">Delete Expense</h2>
+                                <p class="text-gray-400 text-sm">Remove unwanted entries</p>
+                            </div>
+                        </div>
+                        
+                        <div class="mb-6">
+                            <label class="block text-sm font-medium text-gray-300 mb-2">Select expense to delete</label>
+                            <select id="deleteSelect" class="input-field w-full px-4 py-3 rounded-xl text-white">
+                                <option value="">Select an expense</option>
+                            </select>
+                        </div>
+                        
+                        <button onclick="deleteSelectedExpense()" class="danger-btn w-full py-4 rounded-xl font-semibold text-lg flex items-center justify-center gap-2">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                            </svg>
+                            Delete Selected Expense
+                        </button>
+                        
+                        <div id="emptyDeleteState" class="hidden text-center py-8">
+                            <p class="text-gray-400">No expenses to delete</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        // ========== DATA MANAGEMENT ==========
+        const USERS_KEY = 'smartspend_users';
+        const CURRENT_USER_KEY = 'smartspend_current_user';
+        
+        function getUsers() {
+            return JSON.parse(localStorage.getItem(USERS_KEY) || '{}');
+        }
+        
+        function saveUsers(users) {
+            localStorage.setItem(USERS_KEY, JSON.stringify(users));
+        }
+        
+        function getCurrentUser() {
+            return localStorage.getItem(CURRENT_USER_KEY);
+        }
+        
+        function setCurrentUser(username) {
+            localStorage.setItem(CURRENT_USER_KEY, username);
+        }
+        
+        function getExpenses() {
+            const username = getCurrentUser();
+            if (!username) return [];
+            const users = getUsers();
+            return users[username]?.expenses || [];
+        }
+        
+        function saveExpenses(expenses) {
+            const username = getCurrentUser();
+            if (!username) return;
+            const users = getUsers();
+            if (!users[username]) users[username] = { expenses: [] };
+            users[username].expenses = expenses;
+            saveUsers(users);
+        }
+        
+        // ========== AUTHENTICATION ==========
+        function hashPassword(password) {
+            let hash = 0;
+            for (let i = 0; i < password.length; i++) {
+                const char = password.charCodeAt(i);
+                hash = ((hash << 5) - hash) + char;
+                hash = hash & hash;
+            }
+            return hash.toString();
+        }
+        
+        function showLogin() {
+            document.getElementById('loginForm').classList.remove('hidden');
+            document.getElementById('registerForm').classList.add('hidden');
+        }
+        
+        function showRegister() {
+            document.getElementById('loginForm').classList.add('hidden');
+            document.getElementById('registerForm').classList.remove('hidden');
+        }
+        
+        function login() {
+            const username = document.getElementById('loginUsername').value.trim();
+            const password = document.getElementById('loginPassword').value;
+            
+            if (!username || !password) {
+                showNotification('Please fill in all fields', 'error');
+                return;
+            }
+            
+            const users = getUsers();
+            if (users[username] && users[username].password === hashPassword(password)) {
+                setCurrentUser(username);
+                showMainApp();
+                showNotification('Welcome back, ' + username + '!', 'success');
+            } else {
+                showNotification('Invalid username or password', 'error');
+            }
+        }
+        
+        function register() {
+            const username = document.getElementById('regUsername').value.trim();
+            const email = document.getElementById('regEmail').value.trim();
+            const password = document.getElementById('regPassword').value;
+            const confirmPassword = document.getElementById('regConfirmPassword').value;
+            
+            if (!username || !password) {
+                showNotification('Username and password are required', 'error');
+                return;
+            }
+            
+            if (password.length < 6) {
+                showNotification('Password must be at least 6 characters', 'error');
+                return;
+            }
+            
+            if (password !== confirmPassword) {
+                showNotification('Passwords do not match', 'error');
+                return;
+            }
+            
+            const users = getUsers();
+            if (users[username]) {
+                showNotification('Username already exists', 'error');
+                return;
+            }
+            
+            users[username] = {
+                password: hashPassword(password),
+                email: email,
+                expenses: [],
+                createdAt: new Date().toISOString()
+            };
+            
+            saveUsers(users);
+            showNotification('Account created! Please login.', 'success');
+            showLogin();
+            
+            document.getElementById('regUsername').value = '';
+            document.getElementById('regEmail').value = '';
+            document.getElementById('regPassword').value = '';
+            document.getElementById('regConfirmPassword').value = '';
+        }
+        
+        function logout() {
+            localStorage.removeItem(CURRENT_USER_KEY);
+            document.getElementById('authPage').classList.remove('hidden');
+            document.getElementById('mainApp').classList.add('hidden');
+            document.getElementById('loginUsername').value = '';
+            document.getElementById('loginPassword').value = '';
+            showNotification('Logged out successfully', 'success');
+        }
+        
+        function showMainApp() {
+            const username = getCurrentUser();
+            document.getElementById('authPage').classList.add('hidden');
+            document.getElementById('mainApp').classList.remove('hidden');
+            document.getElementById('welcomeUser').textContent = username;
+            document.getElementById('userAvatar').textContent = username.charAt(0).toUpperCase();
+            
+            // Set default date
+            document.getElementById('expenseDate').valueAsDate = new Date();
+            
+            updateDashboard();
+        }
+        
+        // ========== NOTIFICATIONS ==========
+        function showNotification(message, type = 'info') {
+            const notification = document.getElementById('notification');
+            const bgColor = type === 'success' ? 'bg-emerald-500' : type === 'error' ? 'bg-red-500' : 'bg-indigo-500';
+            
+            notification.innerHTML = `
+                <div class="notification ${bgColor} text-white px-6 py-4 rounded-xl shadow-lg flex items-center gap-3">
+                    ${type === 'success' ? 
+                        '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>' : 
+                        type === 'error' ?
+                        '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>' :
+                        '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>'
+                    }
+                    <span class="font-medium">${message}</span>
+                </div>
+            `;
+            
+            notification.classList.remove('hidden');
+            
+            setTimeout(() => {
+                notification.classList.add('hidden');
+            }, 3000);
+        }
+        
+        // ========== PAGE NAVIGATION ==========
+        function showPage(page) {
+            // Hide all pages
+            document.getElementById('dashboardPage').classList.add('hidden');
+            document.getElementById('addPage').classList.add('hidden');
+            document.getElementById('viewPage').classList.add('hidden');
+            document.getElementById('deletePage').classList.add('hidden');
+            
+            // Remove active from all nav buttons
+            document.querySelectorAll('.nav-btn').forEach(btn => btn.classList.remove('active'));
+            
+            // Show selected page
+            document.getElementById(page + 'Page').classList.remove('hidden');
+            document.querySelector(`[data-page="${page}"]`).classList.add('active');
+            
+            // Update content based on page
+            if (page === 'dashboard') updateDashboard();
+            if (page === 'view') updateExpenseTable();
+            if (page === 'delete') updateDeleteSelect();
+        }
+        
+        // ========== EXPENSE OPERATIONS ==========
+        function addExpense(category, amount, date, description) {
+            const expenses = getExpenses();
+            const newExpense = {
+                id: Date.now(),
+                category,
+                amount: parseFloat(amount),
+                date,
+                description: description || '',
+                createdAt: new Date().toISOString()
+            };
+            expenses.push(newExpense);
+            saveExpenses(expenses);
+            return true;
+        }
+        
+        function deleteExpense(id) {
+            let expenses = getExpenses();
+            expenses = expenses.filter(e => e.id !== id);
+            saveExpenses(expenses);
+            return true;
+        }
+        
+        function deleteSelectedExpense() {
+            const select = document.getElementById('deleteSelect');
+            const id = parseInt(select.value);
+            
+            if (!id) {
+                showNotification('Please select an expense to delete', 'error');
+                return;
+            }
+            
+            if (deleteExpense(id)) {
+                showNotification('Expense deleted successfully!', 'success');
+                updateDeleteSelect();
+                updateDashboard();
+            }
+        }
+        
+        // ========== FORMAT HELPERS ==========
+        function formatCurrency(amount) {
+            return '₹' + amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+        
+        function formatDate(dateStr) {
+            const date = new Date(dateStr);
+            return date.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+        }
+        
+        function getCategoryEmoji(category) {
+            const emojis = {
+                'Food': '🍔',
+                'Transport': '🚗',
+                'Shopping': '🛍️',
+                'Bills': '📄',
+                'Entertainment': '🎬',
+                'Healthcare': '🏥',
+                'Other': '📦'
+            };
+            return emojis[category] || '📦';
+        }
+        
+        // ========== DASHBOARD ==========
+        let monthlyChart, categoryChart, dailyChart, categoryBarChart;
+        
+        function updateDashboard() {
+            const expenses = getExpenses();
+            
+            if (expenses.length === 0) {
+                document.getElementById('emptyDashboard').classList.remove('hidden');
+                document.querySelectorAll('.metric-card, .chart-container').forEach(el => el.classList.add('hidden'));
+                return;
+            }
+            
+            document.getElementById('emptyDashboard').classList.add('hidden');
+            document.querySelectorAll('.metric-card, .chart-container').forEach(el => el.classList.remove('hidden'));
+            
+            // Calculate metrics
+            const now = new Date();
+            const thisMonth = expenses.filter(e => {
+                const d = new Date(e.date);
+                return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+            });
+            
+            const last7Days = expenses.filter(e => {
+                const d = new Date(e.date);
+                const diff = (now - d) / (1000 * 60 * 60 * 24);
+                return diff <= 7;
+            });
+            
+            const last30Days = expenses.filter(e => {
+                const d = new Date(e.date);
+                const diff = (now - d) / (1000 * 60 * 60 * 24);
+                return diff <= 30;
+            });
+            
+            const total = expenses.reduce((sum, e) => sum + e.amount, 0);
+            const monthTotal = thisMonth.reduce((sum, e) => sum + e.amount, 0);
+            const last7Total = last7Days.reduce((sum, e) => sum + e.amount, 0);
+            const last30Total = last30Days.reduce((sum, e) => sum + e.amount, 0);
+            const avgExpense = total / expenses.length;
+            const dailyAvg = last30Total / 30;
+            
+            // Find top category
+            const categoryTotals = {};
+            expenses.forEach(e => {
+                categoryTotals[e.category] = (categoryTotals[e.category] || 0) + e.amount;
+            });
+            const topCategory = Object.entries(categoryTotals).sort((a, b) => b[1] - a[1])[0]?.[0] || 'N/A';
+            
+            // Update metrics
+            document.getElementById('metricTotal').textContent = formatCurrency(total);
+            document.getElementById('metricMonth').textContent = formatCurrency(monthTotal);
+            document.getElementById('metricCount').textContent = expenses.length;
+            document.getElementById('metricAvg').textContent = formatCurrency(dailyAvg);
+            document.getElementById('metric7Days').textContent = formatCurrency(last7Total);
+            document.getElementById('metric30Days').textContent = formatCurrency(last30Total);
+            document.getElementById('metricAvgExpense').textContent = formatCurrency(avgExpense);
+            document.getElementById('metricTopCat').textContent = getCategoryEmoji(topCategory) + ' ' + topCategory;
+            
+            // Update charts
+            updateCharts(expenses);
+        }
+        
+        function updateCharts(expenses) {
+            // Monthly trends
+            const monthlyData = {};
+            expenses.forEach(e => {
+                const d = new Date(e.date);
+                const key = d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+                monthlyData[key] = (monthlyData[key] || 0) + e.amount;
+            });
+            
+            const monthLabels = Object.keys(monthlyData);
+            const monthValues = Object.values(monthlyData);
+            
+            if (monthlyChart) monthlyChart.destroy();
+            monthlyChart = new Chart(document.getElementById('monthlyChart'), {
+                type: 'line',
+                data: {
+                    labels: monthLabels,
+                    datasets: [{
+                        label: 'Monthly Spending',
+                        data: monthValues,
+                        borderColor: '#667eea',
+                        backgroundColor: 'rgba(102, 126, 234, 0.1)',
+                        fill: true,
+                        tension: 0.4,
+                        pointBackgroundColor: '#667eea',
+                        pointBorderColor: '#fff',
+                        pointBorderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        legend: { display: false }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            grid: { color: 'rgba(255,255,255,0.05)' },
+                            ticks: { color: '#9ca3af' }
+                        },
+                        x: {
+                            grid: { display: false },
+                            ticks: { color: '#9ca3af' }
+                        }
+                    }
+                }
+            });
+            
+            // Category pie chart
+            const categoryData = {};
+            expenses.forEach(e => {
+                categoryData[e.category] = (categoryData[e.category] || 0) + e.amount;
+            });
+            
+            if (categoryChart) categoryChart.destroy();
+            categoryChart = new Chart(document.getElementById('categoryChart'), {
+                type: 'doughnut',
+                data: {
+                    labels: Object.keys(categoryData),
+                    datasets: [{
+                        data: Object.values(categoryData),
+                        backgroundColor: [
+                            '#667eea', '#8b5cf6', '#ec4899', '#f43f5e', 
+                            '#f97316', '#eab308', '#22c55e', '#14b8a6'
+                        ],
+                        borderWidth: 0
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        legend: {
+                            position: 'right',
+                            labels: { color: '#9ca3af', padding: 20 }
+                        }
+                    },
+                    cutout: '60%'
+                }
+            });
+            
+            // Daily expenses (last 30 days)
+            const now = new Date();
+            const dailyData = {};
+            expenses.forEach(e => {
+                const d = new Date(e.date);
+                const diff = (now - d) / (1000 * 60 * 60 * 24);
+                if (diff <= 30) {
+                    const key = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                    dailyData[key] = (dailyData[key] || 0) + e.amount;
+                }
+            });
+            
+            if (dailyChart) dailyChart.destroy();
+            dailyChart = new Chart(document.getElementById('dailyChart'), {
+                type: 'bar',
+                data: {
+                    labels: Object.keys(dailyData),
+                    datasets: [{
+                        label: 'Daily Spending',
+                        data: Object.values(dailyData),
+                        backgroundColor: '#10b981',
+                        borderRadius: 6
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            grid: { color: 'rgba(255,255,255,0.05)' },
+                            ticks: { color: '#9ca3af' }
+                        },
+                        x: {
+                            grid: { display: false },
+                            ticks: { color: '#9ca3af', maxRotation: 45 }
+                        }
+                    }
+                }
+            });
+            
+            // Category bar chart
+            const sortedCategories = Object.entries(categoryData).sort((a, b) => b[1] - a[1]);
+            
+            if (categoryBarChart) categoryBarChart.destroy();
+            categoryBarChart = new Chart(document.getElementById('categoryBarChart'), {
+                type: 'bar',
+                data: {
+                    labels: sortedCategories.map(c => c[0]),
+                    datasets: [{
+                        label: 'Amount',
+                        data: sortedCategories.map(c => c[1]),
+                        backgroundColor: '#8b5cf6',
+                        borderRadius: 6
+                    }]
+                },
+                options: {
+                    indexAxis: 'y',
+                    responsive: true,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: {
+                            beginAtZero: true,
+                            grid: { color: 'rgba(255,255,255,0.05)' },
+                            ticks: { color: '#9ca3af' }
+                        },
+                        y: {
+                            grid: { display: false },
+                            ticks: { color: '#9ca3af' }
+                        }
+                    }
+                }
+            });
+        }
+        
+        // ========== EXPENSE TABLE ==========
+        function updateExpenseTable(filter = '') {
+            const expenses = getExpenses();
+            const tbody = document.getElementById('expenseTableBody');
+            const emptyState = document.getElementById('emptyViewState');
+            const countText = document.getElementById('expenseCountText');
+            
+            let filteredExpenses = expenses;
+            if (filter) {
+                const lowerFilter = filter.toLowerCase();
+                filteredExpenses = expenses.filter(e => 
+                    e.category.toLowerCase().includes(lowerFilter) ||
+                    e.description.toLowerCase().includes(lowerFilter)
+                );
+            }
+            
+            // Sort by date descending
+            filteredExpenses.sort((a, b) => new Date(b.date) - new Date(a.date));
+            
+            countText.textContent = `${filteredExpenses.length} expense${filteredExpenses.length !== 1 ? 's' : ''}`;
+            
+            if (filteredExpenses.length === 0) {
+                tbody.innerHTML = '';
+                emptyState.classList.remove('hidden');
+                return;
+            }
+            
+            emptyState.classList.add('hidden');
+            
+            tbody.innerHTML = filteredExpenses.map(e => `
+                <tr class="table-row">
+                    <td class="px-6 py-4 text-sm text-gray-300">${formatDate(e.date)}</td>
+                    <td class="px-6 py-4">
+                        <span class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white/5 text-sm">
+                            ${getCategoryEmoji(e.category)} ${e.category}
+                        </span>
+                    </td>
+                    <td class="px-6 py-4 text-sm text-gray-400">${e.description || '-'}</td>
+                    <td class="px-6 py-4 text-sm font-semibold text-right text-emerald-400">${formatCurrency(e.amount)}</td>
+                </tr>
+            `).join('');
+        }
+        
+        // ========== DELETE SELECT ==========
+        function updateDeleteSelect() {
+            const expenses = getExpenses();
+            const select = document.getElementById('deleteSelect');
+            const emptyState = document.getElementById('emptyDeleteState');
+            
+            // Sort by date descending
+            expenses.sort((a, b) => new Date(b.date) - new Date(a.date));
+            
+            if (expenses.length === 0) {
+                select.classList.add('hidden');
+                document.querySelector('#deletePage button').classList.add('hidden');
+                emptyState.classList.remove('hidden');
+                return;
+            }
+            
+            select.classList.remove('hidden');
+            document.querySelector('#deletePage button').classList.remove('hidden');
+            emptyState.classList.add('hidden');
+            
+            select.innerHTML = '<option value="">Select an expense</option>' + 
+                expenses.map(e => `
+                    <option value="${e.id}">
+                        ${formatDate(e.date)} - ${getCategoryEmoji(e.category)} ${e.category} - ${formatCurrency(e.amount)}${e.description ? ' - ' + e.description : ''}
+                    </option>
+                `).join('');
+        }
+        
+        // ========== EVENT LISTENERS ==========
+        document.getElementById('addExpenseForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            
+            const category = document.getElementById('expenseCategory').value;
+            const amount = document.getElementById('expenseAmount').value;
+            const date = document.getElementById('expenseDate').value;
+            const description = document.getElementById('expenseDesc').value;
+            
+            if (!category || !amount || !date) {
+                showNotification('Please fill in all required fields', 'error');
+                return;
+            }
+            
+            if (addExpense(category, amount, date, description)) {
+                showNotification('Expense added successfully!', 'success');
+                this.reset();
+                document.getElementById('expenseDate').valueAsDate = new Date();
+                updateDashboard();
+            }
+        });
+        
+        document.getElementById('searchExpenses').addEventListener('input', function(e) {
+            updateExpenseTable(e.target.value);
+        });
+        
+        // Login on Enter key
+        document.getElementById('loginPassword').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') login();
+        });
+        
+        document.getElementById('regConfirmPassword').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') register();
+        });
+        
+        // ========== INITIALIZATION ==========
+        document.addEventListener('DOMContentLoaded', function() {
+            const currentUser = getCurrentUser();
+            if (currentUser) {
+                showMainApp();
+            }
+        });
+    </script>
+</body>
+</html>

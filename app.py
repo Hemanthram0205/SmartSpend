@@ -6,6 +6,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from contextlib import contextmanager
 import hashlib
+import os
+import re
 
 # ---------- PAGE CONFIG (MUST BE FIRST) ----------
 st.set_page_config(
@@ -39,6 +41,14 @@ def init_db():
                       email TEXT,
                       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
         
+        # Categories table
+        c.execute('''CREATE TABLE IF NOT EXISTS categories
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      user_id INTEGER NOT NULL,
+                      name TEXT NOT NULL,
+                      emoji TEXT,
+                      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)''')
+
         # Check if expenses table exists
         c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='expenses'")
         table_exists = c.fetchone() is not None
@@ -71,10 +81,18 @@ def init_db():
 
 # ---------- AUTHENTICATION FUNCTIONS ----------
 def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+    salt = os.urandom(16).hex()
+    pw_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), 100000).hex()
+    return f"pbkdf2${salt}${pw_hash}"
 
 def verify_password(password, password_hash):
-    return hash_password(password) == password_hash
+    if password_hash.startswith('pbkdf2$'):
+        _, salt, hash_val = password_hash.split('$')
+        pw_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), 100000).hex()
+        return pw_hash == hash_val
+    else:
+        # Fallback to legacy sha256
+        return hashlib.sha256(password.encode()).hexdigest() == password_hash
 
 def create_user(username, password, email=None):
     with get_db_connection() as conn:
@@ -84,6 +102,8 @@ def create_user(username, password, email=None):
                 return False, "Username and password are required"
             if len(password) < 6:
                 return False, "Password must be at least 6 characters"
+            if email and not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+                return False, "Invalid email address format"
             
             password_hash = hash_password(password)
             c.execute("INSERT INTO users (username, password_hash, email) VALUES (?, ?, ?)",
@@ -121,12 +141,17 @@ def get_current_user_expenses(user_id):
             return pd.DataFrame()
 
 def add_expense(category, amount, expense_date, description, user_id):
+    if description and len(description) > 200:
+        description = description[:200]
+        
     with get_db_connection() as conn:
         c = conn.cursor()
         try:
+            date_str = expense_date.isoformat() if hasattr(expense_date, 'isoformat') else str(expense_date)
+            desc_str = description.strip() if description else ""
             c.execute(
                 "INSERT INTO expenses (category, amount, date, description, user_id) VALUES (?, ?, ?, ?, ?)",
-                (category.strip(), amount, expense_date.isoformat(), description.strip(), user_id)
+                (category.strip(), amount, date_str, desc_str, user_id)
             )
             conn.commit()
             return True
@@ -142,42 +167,43 @@ def delete_expense(expense_id, user_id):
         return c.rowcount > 0
 
 def get_expense_summary(user_id):
-    df = get_current_user_expenses(user_id)
-    if df.empty:
-        return None
-    
-    if 'date' not in df.columns or 'amount' not in df.columns:
-        return None
+    with get_db_connection() as conn:
+        c = conn.cursor()
         
-    df['date'] = pd.to_datetime(df['date'])
-    
-    today = datetime.now()
-    last_30_days = today - timedelta(days=30)
-    last_7_days = today - timedelta(days=7)
-    
-    current_month_expenses = df[
-        (df['date'].dt.month == today.month) & 
-        (df['date'].dt.year == today.year)
-    ]['amount'].sum()
-    
-    last_30_days_expenses = df[df['date'] >= last_30_days]['amount'].sum()
-    last_7_days_expenses = df[df['date'] >= last_7_days]['amount'].sum()
-    
-    top_category = 'N/A'
-    if not df['category'].empty and not df['category'].mode().empty:
-        top_category = df['category'].mode().iloc[0]
-    
-    return {
-        'total_expenses': df['amount'].sum(),
-        'average_expense': df['amount'].mean(),
-        'expense_count': len(df),
-        'top_category': top_category,
-        'largest_expense': df['amount'].max(),
-        'monthly_expenses': current_month_expenses,
-        'last_30_days': last_30_days_expenses,
-        'last_7_days': last_7_days_expenses,
-        'daily_average': last_30_days_expenses / 30 if last_30_days_expenses else 0
-    }
+        # Main aggregations
+        c.execute("""
+            SELECT 
+                COALESCE(SUM(amount), 0) as total_expenses,
+                COALESCE(AVG(amount), 0) as average_expense,
+                COUNT(id) as expense_count,
+                COALESCE(MAX(amount), 0) as largest_expense,
+                COALESCE(SUM(CASE WHEN strftime('%Y-%m', date) = strftime('%Y-%m', 'now', 'localtime') THEN amount ELSE 0 END), 0) as monthly_expenses,
+                COALESCE(SUM(CASE WHEN date >= date('now', '-30 days', 'localtime') THEN amount ELSE 0 END), 0) as last_30_days,
+                COALESCE(SUM(CASE WHEN date >= date('now', '-7 days', 'localtime') THEN amount ELSE 0 END), 0) as last_7_days
+            FROM expenses 
+            WHERE user_id = ?
+        """, (user_id,))
+        
+        row = c.fetchone()
+        if not row or row['expense_count'] == 0:
+            return None
+            
+        summary = dict(row)
+        summary['daily_average'] = summary['last_30_days'] / 30 if summary['last_30_days'] else 0
+        
+        # Top category
+        c.execute("""
+            SELECT category 
+            FROM expenses 
+            WHERE user_id = ? 
+            GROUP BY category 
+            ORDER BY COUNT(id) DESC 
+            LIMIT 1
+        """, (user_id,))
+        cat_row = c.fetchone()
+        summary['top_category'] = cat_row['category'] if cat_row else 'N/A'
+        
+        return summary
 
 def format_currency(amount):
     return f"₹{amount:,.2f}"
@@ -655,8 +681,36 @@ CATEGORY_EMOJIS = {
     "Other": "📦"
 }
 
+def get_user_categories(user_id):
+    cats = CATEGORY_EMOJIS.copy()
+    if not user_id: 
+        return cats
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        try:
+            c.execute("SELECT name, emoji FROM categories WHERE user_id = ?", (user_id,))
+            for row in c.fetchall():
+                cats[row['name']] = row['emoji'] or "📦"
+        except sqlite3.OperationalError:
+            pass # Table might not exist yet during init
+    return cats
+
 def get_category_emoji(category):
-    return CATEGORY_EMOJIS.get(category, "📦")
+    user_id = st.session_state.get('user_id')
+    cats = get_user_categories(user_id)
+    return cats.get(category, "📦")
+
+def add_custom_category(user_id, name, emoji):
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        # Avoid duplicates
+        c.execute("SELECT id FROM categories WHERE user_id=? AND name=?", (user_id, name.strip()))
+        if not c.fetchone():
+            c.execute("INSERT INTO categories (user_id, name, emoji) VALUES (?, ?, ?)", 
+                      (user_id, name.strip(), emoji.strip() if emoji else "📦"))
+            conn.commit()
+            return True
+        return False
 
 # ---------- AUTHENTICATION PAGE ----------
 def show_auth_page():
@@ -939,9 +993,10 @@ def show_add_expense():
         col1, col2 = st.columns(2)
         
         with col1:
+            user_cats = get_user_categories(st.session_state.user_id)
             category = st.selectbox(
                 "Category",
-                ["Food", "Transport", "Shopping", "Bills", "Entertainment", "Healthcare", "Other"],
+                list(user_cats.keys()),
                 format_func=lambda x: f"{get_category_emoji(x)} {x}"
             )
             amount = st.number_input("Amount (₹)", min_value=0.01, step=0.01, format="%.2f")
@@ -965,6 +1020,24 @@ def show_add_expense():
                 st.error("⚠️ Please fill in all required fields")
     
     st.markdown("</div>", unsafe_allow_html=True)
+    
+    with st.expander("🛠️ Manage Custom Categories"):
+        with st.form("add_category_form", clear_on_submit=True):
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                new_cat_name = st.text_input("New Category Name", placeholder="e.g. Travel")
+            with col2:
+                new_cat_emoji = st.text_input("Emoji", max_chars=2, placeholder="✈️")
+            submit_cat = st.form_submit_button("Add Category")
+            if submit_cat:
+                if new_cat_name:
+                    if add_custom_category(st.session_state.user_id, new_cat_name, new_cat_emoji):
+                        st.success(f"Added new category: {new_cat_emoji} {new_cat_name}")
+                        st.rerun()
+                    else:
+                        st.error("Category already exists!")
+                else:
+                    st.error("Please enter a category name.")
 
 def show_view_all():
     st.markdown("<div class='section-header'>📋 All Expenses</div>", unsafe_allow_html=True)
@@ -980,46 +1053,85 @@ def show_view_all():
             </div>
         """, unsafe_allow_html=True)
     else:
-        # Search filter
-        search_term = st.text_input("🔍 Search expenses", placeholder="Search by category or description...")
+        # Action Bar
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            st.markdown("<br>", unsafe_allow_html=True)  # alignment
+            csv_data = df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="⬇️ Download CSV",
+                data=csv_data,
+                file_name='smartspend_expenses.csv',
+                mime='text/csv',
+                use_container_width=True
+            )
+            
+        with col1:
+            st.markdown("<p style='color: #94a3b8; padding-top: 15px;'>Edit cells directly or select rows to delete. Click Save Changes when done.</p>", unsafe_allow_html=True)
         
-        filtered_df = df.copy()
-        if search_term:
-            filtered_df = filtered_df[
-                filtered_df['category'].str.lower().str.contains(search_term.lower()) |
-                filtered_df['description'].str.lower().str.contains(search_term.lower())
-            ]
+        # Prepare DataEditor
+        edit_df = df[['id', 'date', 'category', 'description', 'amount']].copy()
+        edit_df['date'] = pd.to_datetime(edit_df['date']).dt.date
         
-        st.markdown(f"<p style='color: #94a3b8; margin-bottom: 20px;'>Showing {len(filtered_df)} expense(s)</p>", unsafe_allow_html=True)
+        edited_state = st.data_editor(
+            edit_df,
+            hide_index=True,
+            column_config={
+                "id": None, # hidden
+                "date": st.column_config.DateColumn("Date", required=True),
+                "category": st.column_config.SelectboxColumn(
+                    "Category",
+                    help="Expense Category",
+                    width="medium",
+                    options=list(get_user_categories(st.session_state.user_id).keys()),
+                    required=True
+                ),
+                "description": st.column_config.TextColumn("Description"),
+                "amount": st.column_config.NumberColumn("Amount (₹)", min_value=0.01, format="%.2f", required=True)
+            },
+            num_rows="dynamic",
+            use_container_width=True,
+            key="expense_editor_grid"
+        )
         
-        # Display expenses with delete button
-        for idx, row in filtered_df.iterrows():
-            col1, col2, col3, col4, col5 = st.columns([1.5, 2, 3, 2, 1])
+        # We need a form or simple button to save
+        if st.button("💾 Save Changes", use_container_width=True):
+            changes = st.session_state.expense_editor_grid
+            changes_made = False
             
-            with col1:
-                st.markdown(f"<p style='color: #94a3b8; padding-top: 8px;'>{row['date'].strftime('%d %b %Y')}</p>", unsafe_allow_html=True)
+            # Deletions
+            for row_idx in changes.get("deleted_rows", []):
+                expense_id = int(edit_df.iloc[row_idx]["id"])
+                delete_expense(expense_id, st.session_state.user_id)
+                changes_made = True
             
-            with col2:
-                st.markdown(f"<p style='color: #e2e8f0; padding-top: 8px;'>{get_category_emoji(row['category'])} {row['category']}</p>", unsafe_allow_html=True)
-            
-            with col3:
-                desc = row['description'] if row['description'] else "-"
-                st.markdown(f"<p style='color: #94a3b8; padding-top: 8px;'>{desc}</p>", unsafe_allow_html=True)
-            
-            with col4:
-                st.markdown(f"<p style='color: #10b981; font-weight: 600; padding-top: 8px;'>{format_currency(row['amount'])}</p>", unsafe_allow_html=True)
-            
-            with col5:
-                st.markdown("<div class='delete-btn'>", unsafe_allow_html=True)
-                if st.button("🗑️", key=f"delete_{row['id']}", help="Delete this expense"):
-                    if delete_expense(row['id'], st.session_state.user_id):
-                        st.success("✅ Deleted!")
-                        st.rerun()
-                    else:
-                        st.error("❌ Failed to delete")
-                st.markdown("</div>", unsafe_allow_html=True)
-            
-            st.markdown("<hr style='margin: 5px 0; opacity: 0.1;'>", unsafe_allow_html=True)
+            # Edits
+            for row_idx, edits in changes.get("edited_rows", {}).items():
+                row_idx = int(row_idx)
+                orig_row = edit_df.iloc[row_idx]
+                expense_id = int(orig_row["id"])
+                new_cat = edits.get("category", orig_row["category"])
+                new_desc = edits.get("description", orig_row["description"])
+                new_amt = edits.get("amount", orig_row["amount"])
+                new_date = edits.get("date", orig_row["date"])
+                
+                with get_db_connection() as conn:
+                    conn.execute("UPDATE expenses SET category=?, description=?, amount=?, date=? WHERE id=? AND user_id=?", 
+                                 (new_cat, new_desc, new_amt, str(new_date), expense_id, st.session_state.user_id))
+                    conn.commit()
+                changes_made = True
+                    
+            # Additions
+            for row in changes.get("added_rows", []):
+                if "amount" in row and "category" in row and "date" in row:
+                    add_expense(row["category"], row["amount"], row["date"], row.get("description", ""), st.session_state.user_id)
+                    changes_made = True
+                    
+            if changes_made:
+                st.success("✅ Changes saved successfully!")
+                st.rerun()
+            else:
+                st.info("No changes to save.")
 
 # ---------- MAIN APP LOGIC ----------
 if st.session_state.show_login or st.session_state.user_id is None:
